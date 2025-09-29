@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
+#include <time.h>
 
 /*
     single threaded manager process to support management 

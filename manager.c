@@ -1,10 +1,5 @@
 #include "manager.h"
 #include "logging.h"
-#include <netinet/in.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/socket.h>
 
 static User users[MAX_PEERS];
 static int user_count = 0;
@@ -18,13 +13,65 @@ static int dss_count = 0;
 static int SOCK;
 struct sockaddr_in MANAGER_ADDR;
 static uint16_t MANAGER_PORT;
+static int g_rng_seeded = 0;
 
-static int is_power_of_two(uint32_t n) {
+static int is_power_of_two(uint32_t n)
+{
     return n && !(n & (n - 1));
+}
+
+static int port_in_use(uint16_t p)
+{
+    for (int i = 0; i < user_count; i++)
+        if (users[i].mport == p || users[i].cport == p) return 1;
+    for (int i = 0; i < disk_count; i++)
+        if (disks[i].mport == p || disks[i].cport == p) return 1;
+    return 0;
+}
+
+static int valid_ports(uint16_t m, uint16_t c)
+{
+    if (m == c) return 0;
+    return !port_in_use(m) && !port_in_use(c);
+}
+
+static int is_valid_name(const char* s)
+{
+    int len = 0;
+    for (; *s; s++, len++) {
+        if (!isalpha((unsigned char)*s)) {
+            return 0;
+        }
+    }
+    return (len > 0 && len <= 15);
+}
+
+static void init_rng(void) {
+    if (!g_rng_seeded) {
+        unsigned seed = (unsigned)time(NULL) ^ (unsigned)getpid();
+        srand(seed);
+        g_rng_seeded = 1;
+    }
 }
 
 int register_user(char* name, char* ip, uint16_t mport, uint16_t cport)
 {
+
+    if (!is_valid_name(name)) { 
+        LOG_INFO("Invalid user name");
+        return -1; 
+    }
+
+    if (user_count >= MAX_PEERS) { 
+        LOG_INFO("Too many users");
+        return -1; 
+    }
+
+    if (!valid_ports(mport, cport)) { 
+        LOG_INFO("Port conflict or mport==cport"); 
+        return -1; 
+    }
+
     for (int i=0; i < user_count; i++) {
         if (strcmp(users[i].name, name) == 0) {
             LOG_INFO("User %s already registered", name);
@@ -49,6 +96,22 @@ int register_user(char* name, char* ip, uint16_t mport, uint16_t cport)
 
 int register_disk(char* name, char* ip, uint16_t mport, uint16_t cport)
 {
+
+    if (!is_valid_name(name)) { 
+        LOG_INFO("Invalid disk name");
+        return -1; 
+    }
+
+    if (disk_count >= MAX_PEERS) { 
+        LOG_INFO("Too many disks"); 
+        return -1; 
+    }
+
+    if (!valid_ports(mport, cport)) {
+        LOG_INFO("Port conflict or mport==cport"); 
+        return -1; 
+    }
+
     for (int i = 0; i < disk_count; i++) {
         if (strcmp(disks[i].name, name) == 0) {
             LOG_INFO("Disk %s already registered", name);
@@ -73,56 +136,70 @@ int register_disk(char* name, char* ip, uint16_t mport, uint16_t cport)
 }
 
 int configure_dss(char *dss_name, int n, uint32_t striping_unit) {
+    // basic checks
+    if (!is_valid_name(dss_name)) {
+        LOG_INFO("DSS configuration failed: invalid name (alphabetic, <=15)");
+        return -1;
+    }
     if (n < 3) {
         LOG_INFO("DSS configuration failed: n must be >= 3");
         return -1;
     }
-    
-    if (!is_power_of_two(striping_unit) || 
-        striping_unit < 128 || striping_unit > 1048576) {
+    if (!is_power_of_two(striping_unit) || striping_unit < 128 || striping_unit > 1048576) {
         LOG_INFO("DSS configuration failed: invalid striping unit");
         return -1;
     }
-    
+    if (dss_count >= MAX_DSS) {
+        LOG_INFO("DSS configuration failed: max DSS reached");
+        return -1;
+    }
     for (int i = 0; i < dss_count; i++) {
         if (strcmp(dss_list[i].name, dss_name) == 0) {
             LOG_INFO("DSS %s already exists", dss_name);
             return -1;
         }
     }
-    
+
+    int free_idx[MAX_PEERS];
     int free_count = 0;
     for (int i = 0; i < disk_count; i++) {
-        if (disks[i].state == FREE) free_count++;
+        if (disks[i].state == FREE) {
+            free_idx[free_count++] = i;
+        }
     }
-    
     if (free_count < n) {
         LOG_INFO("Insufficient free disks: need %d, have %d", n, free_count);
         return -1;
     }
-    
+
+    for (int i = free_count - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int t = free_idx[i];
+        free_idx[i] = free_idx[j];
+        free_idx[j] = t;
+    }
+
     strncpy(dss_list[dss_count].name, dss_name, NAME_LEN - 1);
+    dss_list[dss_count].name[NAME_LEN - 1] = '\0';
     dss_list[dss_count].n = n;
     dss_list[dss_count].striping_unit = striping_unit;
-    
-    int assigned = 0;
-    for (int i = 0; i < disk_count && assigned < n; i++) {
-        if (disks[i].state == FREE) {
-            disks[i].state = IN_DSS;
-            strncpy(disks[i].dss_name, dss_name, NAME_LEN - 1);
-            dss_list[dss_count].disk_indices[assigned] = i;
-            assigned++;
-        }
+
+    for (int k = 0; k < n; k++) {
+        int di = free_idx[k];
+        disks[di].state = IN_DSS;
+        strncpy(disks[di].dss_name, dss_name, NAME_LEN - 1);
+        disks[di].dss_name[NAME_LEN - 1] = '\0';
+        dss_list[dss_count].disk_indices[k] = di;
     }
-    
-    LOG_INFO("Configured DSS %s with n=%d, striping_unit=%u", 
+
+    LOG_INFO("Configured DSS %s with n=%d, striping_unit=%u",
              dss_name, n, striping_unit);
     printf("Assigned disks: ");
     for (int i = 0; i < n; i++) {
         printf("%s ", disks[dss_list[dss_count].disk_indices[i]].name);
     }
     printf("\n");
-    
+
     dss_count++;
     return 0;
 }
@@ -229,7 +306,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
     } else if (strncmp(cmd, "deregister-disk", 15) == 0) {
         char name[NAME_LEN];
         if (sscanf(cmd, "deregister-disk %s", name) == 1) {
-            if (deregister_user(name) == 0) {
+            if (deregister_disk(name) == 0) {
                 strcpy(response, "SUCCESS: Deregistered Disk");
             } else {
                 strcpy(response, "FAILURE: Unable to deregister disk");
@@ -277,7 +354,7 @@ int main(int argc, char* argv[])
     }
 
     LOG_INFO("Manager serving on port %hu", MANAGER_PORT);
-
+    init_rng();
     while (1) {
         char cmd[COMMAND_SIZE];
         struct sockaddr_in client_addr;

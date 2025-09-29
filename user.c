@@ -112,10 +112,17 @@ int main(int argc, char* argv[])
     if (sock < 0) {
         LOG_ERROR("socket creation failed");
     }
-    LOG_INFO("socket created successfully."); 
+    LOG_INFO("socket created successfully.");
+
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(MPORT);
+    if (bind(sock, (struct sockaddr*)&local, sizeof(local)) < 0) {
+        LOG_ERROR("bind() with MPORT failed");
+    }
     
     char cmd_buffer[COMMAND_SIZE];
-
     while (1) {
         int cmd = receive_cmd(cmd_buffer, local_ip);
 
