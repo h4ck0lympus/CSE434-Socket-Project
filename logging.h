@@ -1,5 +1,6 @@
 #ifndef LOGGING_H
 #define LOGGING_H
+#include <stdio.h>
 
 #define LOG_INFO(msg, ...) \
     fprintf(stderr, "[INFO] %s:%d: " msg "\n", __FILE__, __LINE__, ##__VA_ARGS__)

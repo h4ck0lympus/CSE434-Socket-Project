@@ -1,16 +1,45 @@
 #include "manager.h"
 #include "logging.h"
 
+static User users[MAX_PEERS];
+static int user_count = 0;
+
+static Disk disks[MAX_PEERS];
+static int disk_count = 0;
+
+static DSS dss_list[MAX_DSS];
+static int dss_count = 0;
+
 struct sockaddr_in manager_addr;
 struct sockaddr_in client_addr;
-
 static uint16_t MANAGER_PORT;
+
+int register_user(char* name, char* ip, uint16_t mport, uint16_t cport)
+{
+    return 0; // SUCCESS
+}
+
+int register_disk(char* name, char* ip, uint16_t mport, uint16_t cport)
+{
+    return 0;
+}
+
+int configure_dss(char* dss_name, int n, uint32_t stripping_unit)
+{
+    return 0;
+}
 
 // TODO
 int command_handler(char *command)
 {
-    (void)command;
-    return 0;
+    if (strcmp(command, "register-user") == 0) {
+        return register_user();
+    } else if (strcmp(command, "register-disk") == 0) {
+        return register_disk();
+    } else {
+        LOG_INFO("Unknown command recieved");
+        return -1;
+    }
 }
 
 int main(int argc, char* argv[])
