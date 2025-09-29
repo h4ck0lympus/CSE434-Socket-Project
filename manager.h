@@ -49,7 +49,7 @@ typedef struct {
 
 // command handler that will handle the incoming commands
 // return 0 is success else -1
-int command_handler(char* command);
+int command_handler(char *, struct sockaddr_in*, socklen_t);
 
 // registers user inside manager's state
 // return 0 is success else -1
