@@ -35,17 +35,6 @@ static int valid_ports(uint16_t m, uint16_t c)
     return !port_in_use(m) && !port_in_use(c);
 }
 
-static int is_valid_name(const char* s)
-{
-    int len = 0;
-    for (; *s; s++, len++) {
-        if (!isalpha((unsigned char)*s)) {
-            return 0;
-        }
-    }
-    return (len > 0 && len <= 15);
-}
-
 static void init_rng(void) {
     if (!g_rng_seeded) {
         unsigned seed = (unsigned)time(NULL) ^ (unsigned)getpid();
@@ -56,12 +45,6 @@ static void init_rng(void) {
 
 int register_user(char* name, char* ip, uint16_t mport, uint16_t cport)
 {
-
-    if (!is_valid_name(name)) { 
-        LOG_INFO("Invalid user name");
-        return -1; 
-    }
-
     if (user_count >= MAX_PEERS) { 
         LOG_INFO("Too many users");
         return -1; 
@@ -96,12 +79,6 @@ int register_user(char* name, char* ip, uint16_t mport, uint16_t cport)
 
 int register_disk(char* name, char* ip, uint16_t mport, uint16_t cport)
 {
-
-    if (!is_valid_name(name)) { 
-        LOG_INFO("Invalid disk name");
-        return -1; 
-    }
-
     if (disk_count >= MAX_PEERS) { 
         LOG_INFO("Too many disks"); 
         return -1; 
@@ -137,10 +114,6 @@ int register_disk(char* name, char* ip, uint16_t mport, uint16_t cport)
 
 int configure_dss(char *dss_name, int n, uint32_t striping_unit) {
     // basic checks
-    if (!is_valid_name(dss_name)) {
-        LOG_INFO("DSS configuration failed: invalid name (alphabetic, <=15)");
-        return -1;
-    }
     if (n < 3) {
         LOG_INFO("DSS configuration failed: n must be >= 3");
         return -1;
@@ -253,11 +226,9 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
                 strcpy(response, "SUCCESS: User registered");
             } else {
                 strcpy(response, "FAILURE: Unable to register user");
-                return -1;
             }
         } else {
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
-            return -1;
         }
     } else if (strncmp(cmd, "register-disk", 13) == 0) {
         char name[NAME_LEN], ip[16];
@@ -268,11 +239,9 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
                 strcpy(response, "SUCCESS: Disk registered");
             } else {
                 strcpy(response, "FAILURE: Unable to register disk");
-                return -1;
             }
         } else {
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
-            return -1;
         }
     } else if (strncmp(cmd, "configure-dss", 13) == 0) {
         char dss_name[NAME_LEN];
@@ -284,11 +253,9 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
                 strcpy(response, "SUCCESS: Dss configured");
             } else {
                 strcpy(response, "FAILURE: Unable to configure dss");
-                return -1;
             }
         } else {
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
-            return -1;
         }
     } else if (strncmp(cmd, "deregister-user", 15) == 0) {
         char name[NAME_LEN];
@@ -297,11 +264,9 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
                 strcpy(response, "SUCCESS: Deregistered User");
             } else {
                 strcpy(response, "FAILURE: Unable to deregister user");
-                return -1;
             }
         } else {
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
-            return -1;
         }
     } else if (strncmp(cmd, "deregister-disk", 15) == 0) {
         char name[NAME_LEN];
@@ -310,15 +275,12 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
                 strcpy(response, "SUCCESS: Deregistered Disk");
             } else {
                 strcpy(response, "FAILURE: Unable to deregister disk");
-                return -1;
             }
         } else {
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
-            return -1;
         }
     } else {
         LOG_INFO("Unknown command: %s", cmd);
-        return -1;
     }
 
     LOG_INFO("[SENDING] %s", response);

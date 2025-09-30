@@ -83,11 +83,12 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
 
 int main(int argc, char* argv[])
 {
-    if (argc != 6) {
-        fprintf(stderr, "Usage: %s <USER NAME> <MANAGER IPv4 ADDRESS> \
-                         <MANAGER PORT> <MANAGEMENT PORT NUMBER> <COMMAND PORT>", argv[0]);
+  if (argc != 6) {
+        fprintf(stderr, "Usage: %s <USER NAME> <MANAGER IPv4 ADDRESS> " \
+                         "<MANAGER PORT> <MANAGEMENT PORT NUMBER> <COMMAND PORT>\n", argv[0]);
         exit(1);
     }
+
 
     char* username = argv[1];
     char* manager_ip = argv[2];
