@@ -20,6 +20,7 @@
 #define MAX_PEERS 100
 #define MAX_DSS 10
 #define NAME_LEN 16
+#define MAX_FILES 1000
 
 typedef struct {
     char name[NAME_LEN];
@@ -44,9 +45,17 @@ typedef struct {
 
 typedef struct {
     char name[NAME_LEN];
+    uint64_t size;
+    char owner[NAME_LEN];
+} File;
+
+typedef struct {
+    char name[NAME_LEN];
     int n;
     uint32_t striping_unit;
     int disk_indices[MAX_PEERS];
+    File files[MAX_FILES];
+    int file_count;
 } DSS;
 
 // command handler that will handle the incoming commands
@@ -62,5 +71,7 @@ int register_user(char*, char*, uint16_t, uint16_t);
 int register_disk(char*, char*, uint16_t, uint16_t);
 
 int configure_dss(char*, int n, uint32_t stripping_unit);
+
+int ls(char* response_buffer, size_t buffer_size);
 
 #endif // MANAGER_H

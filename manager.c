@@ -156,6 +156,7 @@ int configure_dss(char *dss_name, int n, uint32_t striping_unit) {
     dss_list[dss_count].name[NAME_LEN - 1] = '\0';
     dss_list[dss_count].n = n;
     dss_list[dss_count].striping_unit = striping_unit;
+    dss_list[dss_count].file_count = 0;
 
     for (int k = 0; k < n; k++) {
         int di = free_idx[k];
@@ -214,9 +215,46 @@ int deregister_disk(char *name)
     return -1;
 }
 
+int ls(char* response_buffer, size_t buffer_size)
+{
+    if (dss_count == 0) {
+        return -1;
+    }
+
+    int offset = 0;
+    for (int i = 0; i < dss_count; i++) {
+        DSS *dss = &dss_list[i];
+        
+        offset += snprintf(response_buffer + offset, buffer_size - offset,
+                          "%s: Disk array with n=%d (", dss->name, dss->n);
+        
+        for (int j = 0; j < dss->n; j++) {
+            int disk_idx = dss->disk_indices[j];
+            offset += snprintf(response_buffer + offset, buffer_size - offset,
+                              "%s%s", disks[disk_idx].name, 
+                              (j < dss->n - 1) ? ", " : "");
+        }
+        
+        offset += snprintf(response_buffer + offset, buffer_size - offset,
+                          ") with striping-unit %u B.\n", dss->striping_unit);
+        
+        for (int k = 0; k < dss->file_count; k++) {
+            File *file = &dss->files[k];
+            offset += snprintf(response_buffer + offset, buffer_size - offset,
+                              "%s %lu B %s\n", file->name, file->size, file->owner);
+        }
+        
+        if (i < dss_count - 1) {
+            offset += snprintf(response_buffer + offset, buffer_size - offset, "\n");
+        }
+    }
+    
+    return 0;
+}
+
 int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client_len)
 {
-    char response[128];
+    char response[4096];
     if (strncmp(cmd, "register-user", 13) == 0) {
         char name[NAME_LEN], ip[16];
         uint16_t mport, cport;
@@ -279,6 +317,16 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         } else {
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
         }
+    } else if (strncmp(cmd, "ls", 2) == 0) {
+        if (ls(response, sizeof(response)) == 0) {
+            strcpy(response, "SUCCESS\n");
+            ls(response + 8, sizeof(response) - 8);
+        } else {
+            strcpy(response, "FAILURE: No DSSs configured");
+        }
+    } else if (strncmp(cmd, "copy", 4) == 0 ) {
+        // TODO
+        ;
     } else {
         LOG_INFO("Unknown command: %s", cmd);
     }

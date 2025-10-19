@@ -1,4 +1,6 @@
 #include "user.h"
+#include <stdio.h>
+#include <string.h>
 
 static char USERNAME[USERNAME_LEN];
 static struct sockaddr_in MANAGER_ADDR;
@@ -45,6 +47,7 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
     printf("  register-user\n");
     printf("  deregister-user\n");
     printf("  configure-dss <dss-name> <n> <striping-unit>\n");
+    printf("  ls");
     printf("  exit\n\n");
     printf("user-%s> ", USERNAME);
 
@@ -71,6 +74,8 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
         snprintf(cmd_buffer, COMMAND_SIZE, "deregister-user %s", USERNAME);
     } else if (strncmp(line, "configure-dss", 13) == 0) {
 	    strcpy(cmd_buffer, line);
+    } else if (strncmp(line, "ls", 2) == 0) {
+        strcpy(cmd_buffer, "ls");
     } else {
         LOG_INFO("Unknown command: %s", line);
         free(line);
