@@ -51,12 +51,21 @@ typedef struct {
 
 typedef struct {
     char name[NAME_LEN];
-    int n;
+    int n; // number of disks in disk array
     uint32_t striping_unit;
     int disk_indices[MAX_PEERS];
     File files[MAX_FILES];
     int file_count;
 } DSS;
+
+typedef struct {
+    char file_name[NAME_LEN];
+    int file_size;
+    char owner[NAME_LEN];
+    int dss_idx;
+    int is_pending;
+} PendingCopy;
+
 
 // command handler that will handle the incoming commands
 // return 0 is success else -1
@@ -73,5 +82,7 @@ int register_disk(char*, char*, uint16_t, uint16_t);
 int configure_dss(char*, int n, uint32_t stripping_unit);
 
 int ls(char* response_buffer, size_t buffer_size);
+
+int copy(char* file_name, int file_size, char* owner, char* response_buffer, size_t buffer_size);
 
 #endif // MANAGER_H

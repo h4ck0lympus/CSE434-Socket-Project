@@ -47,7 +47,8 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
     printf("  register-user\n");
     printf("  deregister-user\n");
     printf("  configure-dss <dss-name> <n> <striping-unit>\n");
-    printf("  ls");
+    printf("  copy <file-name> <file-size> <owner>\n");
+    printf("  ls\n");
     printf("  exit\n\n");
     printf("user-%s> ", USERNAME);
 
@@ -74,6 +75,8 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
         snprintf(cmd_buffer, COMMAND_SIZE, "deregister-user %s", USERNAME);
     } else if (strncmp(line, "configure-dss", 13) == 0) {
 	    strcpy(cmd_buffer, line);
+    } else if (strncmp(line, "copy", 4) == 0) {
+        strcpy(cmd_buffer, line);
     } else if (strncmp(line, "ls", 2) == 0) {
         strcpy(cmd_buffer, "ls");
     } else {

@@ -1,5 +1,6 @@
 #include "manager.h"
 #include "logging.h"
+#include <string.h>
 
 static User users[MAX_PEERS];
 static int user_count = 0;
@@ -14,6 +15,8 @@ static int SOCK;
 struct sockaddr_in MANAGER_ADDR;
 static uint16_t MANAGER_PORT;
 static int g_rng_seeded = 0;
+
+static PendingCopy pending_copy = {0};
 
 static int is_power_of_two(uint32_t n)
 {
@@ -252,9 +255,66 @@ int ls(char* response_buffer, size_t buffer_size)
     return 0;
 }
 
+int copy(char* file_name, int file_size, char* owner, char* response_buffer, size_t buffer_size) {
+    if (dss_count == 0) {
+        LOG_INFO("No DSSs configured for copy operation");
+        return -1;
+    }
+
+    // randomly select dss 
+    init_rng();
+    int selected_dss_idx = rand() % dss_count;
+    DSS *selected_dss = &dss_list[selected_dss_idx];
+    
+    if (selected_dss->file_count >= MAX_FILES) {
+        LOG_INFO("Selected DSS %s is full", selected_dss->name);
+        return -1;
+    }
+
+    // return : 
+    // the dss name
+    // n: number of disk in disk array
+    // dss striping_unit
+    int offset = 0;
+    offset += snprintf(response_buffer + offset, buffer_size - offset, \
+                      "%s %d %u", selected_dss->name, selected_dss->n, selected_dss->striping_unit);
+   
+    // also return the select dss's :
+    // disk/s name
+    // disk/s ipv4 address
+    // disk/s command port
+    for (int i = 0; i < selected_dss->n; i++) {
+        int disk_idx = selected_dss->disk_indices[i];
+        offset += snprintf(response_buffer + offset, buffer_size - offset, \
+                          " %s %s %hu", disks[disk_idx].name,  \
+                          disks[disk_idx].ipv4_addr, disks[disk_idx].cport);
+    }
+
+    strncpy(pending_copy.file_name, file_name, NAME_LEN - 1);
+    pending_copy.file_name[NAME_LEN - 1] = '\0';
+    pending_copy.file_size = file_size;
+    strncpy(pending_copy.owner, owner, NAME_LEN - 1);
+    pending_copy.owner[NAME_LEN - 1] = '\0';
+    pending_copy.dss_idx = selected_dss_idx;
+    pending_copy.is_pending = 1;
+
+    // phase-1 ended now phase 2 will occur from user's side
+    LOG_INFO("Phase 1: Selected DSS %s for file %s (%d bytes) from owner %s", 
+             selected_dss->name, file_name, file_size, owner);
+    
+    return selected_dss_idx;
+}
+
 int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client_len)
 {
     char response[4096];
+    
+    // check if copy operation is pending, if it is then copy-complete is only allowed
+    if (pending_copy.is_pending && strncmp(cmd, "copy-complete", 13) != 0) {
+        strcpy(response, "FAILURE: Copy operation in progress, only copy-complete allowed");
+        goto send_response;
+    }
+    
     if (strncmp(cmd, "register-user", 13) == 0) {
         char name[NAME_LEN], ip[16];
         uint16_t mport, cport;
@@ -324,13 +384,43 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         } else {
             strcpy(response, "FAILURE: No DSSs configured");
         }
-    } else if (strncmp(cmd, "copy", 4) == 0 ) {
-        // TODO
-        ;
+    } else if (strncmp(cmd, "copy ", 5) == 0) {
+        char file_name[NAME_LEN];
+        int file_size;
+        char owner[NAME_LEN];
+        if (sscanf(cmd, "copy %s %d %s", file_name, &file_size, owner) == 3) {
+            if (copy(file_name, file_size, owner, response + 8, sizeof(response) - 8) >= 0) {
+                strcpy(response, "SUCCESS: copy phase-1 complete");
+            } else {
+                strcpy(response, "FAILURE: No DSSs configured or DSS full");
+            }
+        } else {
+            strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
+        }
+    } else if (strncmp(cmd, "copy-complete", 13) == 0) {
+        if (!pending_copy.is_pending) {
+            strcpy(response, "FAILURE: No pending copy operation");
+        } else {
+            DSS *dss = &dss_list[pending_copy.dss_idx];
+            File *new_file = &dss->files[dss->file_count];
+            strncpy(new_file->name, pending_copy.file_name, NAME_LEN - 1);
+            new_file->name[NAME_LEN - 1] = '\0';
+            new_file->size = pending_copy.file_size;
+            strncpy(new_file->owner, pending_copy.owner, NAME_LEN - 1);
+            new_file->owner[NAME_LEN - 1] = '\0';
+            dss->file_count++;
+            
+            LOG_INFO("Phase 2: File %s successfully added to DSS %s", 
+                     pending_copy.file_name, dss->name);
+            
+            pending_copy.is_pending = 0;
+            strcpy(response, "SUCCESS: copy-complete");
+        }
     } else {
         LOG_INFO("Unknown command: %s", cmd);
     }
 
+send_response:
     LOG_INFO("[SENDING] %s", response);
     sendto(SOCK, response, strlen(response), 0,
            (struct sockaddr*)client_addr, client_len);
