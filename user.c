@@ -1,10 +1,6 @@
 #include "user.h"
 #include "logging.h"
 #include "manager.h"
-#include <netinet/in.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/socket.h>
 
 static char USERNAME[USERNAME_LEN];
 static struct sockaddr_in MANAGER_ADDR;
@@ -849,44 +845,30 @@ static int decommission_params(char *resp)
         LOG_WARN("FAILED: DECOMMISSION-PARAMS arguments not correct. response: %s", resp);
         return -1;
     }
-
-    if (n <= 0) {
-        LOG_WARN("Invalid disk count received in DECOMMISSION-PARAMS");
-        return -1;
-    }
-
-    if (COPY_SOCK < 0) {
-        LOG_WARN("Copy socket not initialized");
-        return -1;
-    }
+    if (n <= 0) { LOG_WARN("Invalid disk count received in DECOMMISSION-PARAMS"); return -1; }
+    if (COPY_SOCK < 0) { LOG_WARN("Copy socket not initialized"); return -1; }
 
     Peer peers[16];
-    if (n > (int)(sizeof(peers) / sizeof(peers[0]))) {
-        LOG_WARN("n is too big");
-        return -1;
-    }
+    if (n > (int)(sizeof(peers)/sizeof(peers[0]))) { LOG_WARN("n is too big"); return -1; }
 
-    // parse disk information from DECOMMISSION-PARAMS response
-    char *cursor = resp + 20; // skip DECOMMISSION-PARAMS
-    for (int skip = 0; skip < 3 && *cursor; ) {
+    // Parse peers after header tokens (dss, n, b)
+    char *cursor = resp + 20; // after "DECOMMISSION-PARAMS"
+    for (int skip = 0; skip < 3 && *cursor; ) {  // skip <dss> <n> <b>
         while (*cursor && *cursor != ' ') cursor++;
         while (*cursor == ' ') cursor++;
         skip++;
     }
-
     for (int i = 0; i < n; i++) {
         if (sscanf(cursor, "%15s %15s %hu",
                    peers[i].name, peers[i].ip, &peers[i].cport) != 3) {
             LOG_WARN("peer info incorrect format @ %d", i);
             return -1;
         }
-
-        for (int skip = 0; skip < 3 && *cursor; ) {
+        for (int skip = 0; skip < 3 && *cursor; ) { // advance to next triple
             while (*cursor && *cursor != ' ') cursor++;
             while (*cursor == ' ') cursor++;
             skip++;
         }
-
         memset(&peers[i].addr, 0, sizeof(peers[i].addr));
         peers[i].addr.sin_family = AF_INET;
         if (inet_pton(AF_INET, peers[i].ip, &peers[i].addr.sin_addr) != 1) {
@@ -897,53 +879,66 @@ static int decommission_params(char *resp)
     }
 
     LOG_INFO("Starting decommission process for DSS %s with %d disks", dss, n);
-    
-    // send FAIL command to ALL disks in the DSS
+
     for (int i = 0; i < n; i++) {
         char fail_cmd[256];
-        snprintf(fail_cmd, sizeof(fail_cmd), "FAIL %s\n", dss);
-        
-        if (sendto(COPY_SOCK, fail_cmd, strlen(fail_cmd), 0,
+        int len = snprintf(fail_cmd, sizeof(fail_cmd), "FAIL %s\n", dss);
+        if (sendto(COPY_SOCK, fail_cmd, len, 0,
                    (struct sockaddr *)&peers[i].addr, sizeof(peers[i].addr)) < 0) {
-            LOG_WARN("Failed to send fail command to disk %s", peers[i].name);
-            continue;
-        }
-        
-        LOG_INFO("Sent FAIL command to disk %s (%s:%hu)", 
-                 peers[i].name, peers[i].ip, peers[i].cport);
-    }
-    
-    // receive fail-complete responses from all disks
-    int completed_disks = 0;
-    for (int i = 0; i < n; i++) {
-        const size_t buf_size = 1024;
-        char buffer[buf_size];
-        struct sockaddr_in src_addr;
-        socklen_t src_len = sizeof(src_addr);
-        ssize_t recv_len = recvfrom(COPY_SOCK, buffer, buf_size - 1, 0,
-                                    (struct sockaddr *)&src_addr, &src_len);
-        
-        if (recv_len < 0) {
-            LOG_WARN("Failed to receive fail-complete response from disk %d", i);
-            continue;
-        }
-        
-        buffer[recv_len] = '\0';
-        if (strncmp(buffer, "FAIL-COMPLETE", 13) == 0) {
-            completed_disks++;
-            LOG_INFO("Received FAIL-COMPLETE from disk (total: %d/%d)", completed_disks, n);
+            LOG_WARN("Failed to send FAIL to disk %s", peers[i].name);
         } else {
-            LOG_WARN("Unexpected response from disk: %s", buffer);
+            LOG_INFO("Sent FAIL to %s (%s:%hu)", peers[i].name, peers[i].ip, peers[i].cport);
         }
     }
-    
-    if (completed_disks == n) {
+
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(COPY_SOCK, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+    int done[16] = {0};
+    int completed = 0;
+    int timeouts = 0;
+    const int MAX_TIMEOUTS = 8 * n;
+
+    while (completed < n && timeouts < MAX_TIMEOUTS) {
+        char buffer[1024];
+        struct sockaddr_in src; socklen_t srclen = sizeof(src);
+        ssize_t r = recvfrom(COPY_SOCK, buffer, sizeof(buffer)-1, 0,
+                             (struct sockaddr*)&src, &srclen);
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                timeouts++; 
+                continue;
+            }
+            LOG_WARN("recv error during decommission: %s", strerror(errno));
+            break;
+        }
+        buffer[r] = '\0';
+
+        int which = -1;
+        for (int i = 0; i < n; i++) {
+            if (src.sin_addr.s_addr == peers[i].addr.sin_addr.s_addr &&
+                src.sin_port        == peers[i].addr.sin_port) {
+                which = i; break;
+            }
+        }
+        if (which < 0) {
+            continue;
+        }
+
+        if (!done[which] && strncmp(buffer, "FAIL-COMPLETE", 13) == 0) {
+            done[which] = 1;
+            completed++;
+            LOG_INFO("Received FAIL-COMPLETE from %s (%d/%d)", peers[which].name, completed, n);
+        }
+        // else: duplicate or unexpected, ignore
+    }
+
+    if (completed == n) {
         LOG_INFO("All %d disks completed failure simulation for DSS %s", n, dss);
     } else {
-        LOG_WARN("Only %d out of %d disks completed failure simulation", completed_disks, n);
+        LOG_WARN("Only %d/%d disks acknowledged decommission wipe", completed, n);
     }
-    
-    // send decommission-complete to manager
+
     const char *dc = "decommission-complete";
     if (sendto(MANAGER_SOCK, dc, strlen(dc), 0,
                (struct sockaddr *)&MANAGER_ADDR, sizeof(MANAGER_ADDR)) < 0) {
@@ -954,6 +949,7 @@ static int decommission_params(char *resp)
     LOG_INFO("Decommission process completed for DSS %s", dss);
     return 0;
 }
+
 
 int receive_cmd(char *cmd_buffer, char *local_ip)
 {

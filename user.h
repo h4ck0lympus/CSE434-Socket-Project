@@ -11,6 +11,11 @@
 #include <ifaddrs.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/socket.h>
 
 #include "logging.h"
 
