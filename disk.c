@@ -143,13 +143,6 @@ static void *copy_listener(void *arg)
         size_t payload_len = (size_t)recv_len - header_len - 1;
         buffer[header_len] = '\0';
 
-        char dss[NAME_LEN];
-        char file_name[NAME_LEN];
-        unsigned int stripe = 0;
-        unsigned int disk_idx = 0;
-        char block_type[8];
-        unsigned int block_size = 0;
-
         // cHeck if this is a WRITE command
         if (strncmp((char *)buffer, "WRITE ", 6) == 0) {
             char dss[NAME_LEN];
@@ -233,6 +226,103 @@ static void *copy_listener(void *arg)
                 sendto(COPY_SOCK, response_header, strlen(response_header), 0,
                        (struct sockaddr *)&src_addr, src_len);
             }
+        }
+        // check if this is a FAIL command
+        else if (strncmp((char *)buffer, "FAIL ", 5) == 0) {
+            char dss_name[NAME_LEN];
+            if (sscanf((char *)buffer, "FAIL %15s", dss_name) != 1) {
+                LOG_INFO("Failed to parse FAIL header: %s", buffer);
+                continue;
+            }
+
+            LOG_INFO("Received FAIL command for DSS %s", dss_name);
+            
+            // simulate disk failure by deleting all blocks for this DSS
+            char dss_path[512];
+            snprintf(dss_path, sizeof(dss_path), "storage/%s/%s", DISK_NAME, dss_name);
+            
+            // Delete the entire DSS directory and its contents
+            char rm_cmd[1024];
+            snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf \"%s\"", dss_path);
+            
+            int result = system(rm_cmd);
+            if (result == 0) {
+                LOG_INFO("Disk failure simulation: Deleted all blocks for DSS %s", dss_name);
+            } else {
+                LOG_WARN("Failed to delete blocks for DSS %s", dss_name);
+            }
+            
+            char response_msg[] = "FAIL-COMPLETE\n";
+            sendto(COPY_SOCK, response_msg, strlen(response_msg), 0,
+                   (struct sockaddr *)&src_addr, src_len);
+            
+            LOG_INFO("Sent FAIL-COMPLETE response for DSS %s", dss_name);
+        }
+        // check if this is a LIST command (for recovery)
+        else if (strncmp((char *)buffer, "LIST ", 5) == 0) {
+            char dss_name[NAME_LEN];
+            if (sscanf((char *)buffer, "LIST %15s", dss_name) != 1) {
+                LOG_INFO("Failed to parse LIST header: %s", buffer);
+                continue;
+            }
+
+            LOG_INFO("Received LIST command for DSS %s", dss_name);
+            
+            // scan storage directory for files in this DSS
+            char dss_path[512];
+            snprintf(dss_path, sizeof(dss_path), "storage/%s/%s", DISK_NAME, dss_name);
+            
+            char response[2048] = "FILE-LIST";
+            DIR *dir = opendir(dss_path);
+            if (dir) {
+                struct dirent *entry;
+                while ((entry = readdir(dir)) != NULL) {
+                    if (entry->d_type == DT_REG) { // Regular file
+                        // parse filename to extract file info
+                        // format: filename_stripeX_diskY_TYPE.bin
+                        char file_name[NAME_LEN];
+                        int stripe_num, disk_num;
+                        char block_type[8];
+                        
+                        if (sscanf(entry->d_name, "%15[^_]_stripe%d_disk%d_%7[^.].bin",
+                                   file_name, &stripe_num, &disk_num, block_type) == 4) {
+                            // add to response if not already included
+                            char search_pattern[64];
+                            snprintf(search_pattern, sizeof(search_pattern), " %s_", file_name);
+                            if (!strstr(response, search_pattern)) {
+                                // count stripes for this file
+                                rewinddir(dir);
+                                int max_stripe = -1;
+                                struct dirent *count_entry;
+                                while ((count_entry = readdir(dir)) != NULL) {
+                                    char count_file[NAME_LEN];
+                                    int count_stripe;
+                                    if (sscanf(count_entry->d_name, "%15[^_]_stripe%d_",
+                                               count_file, &count_stripe) == 2 &&
+                                        strcmp(count_file, file_name) == 0) {
+                                        if (count_stripe > max_stripe) {
+                                            max_stripe = count_stripe;
+                                        }
+                                    }
+                                }
+                                
+                                // add file with stripe count to response
+                                char file_entry[64];
+                                snprintf(file_entry, sizeof(file_entry), " %s_%d", 
+                                         file_name, max_stripe + 1);
+                                strncat(response, file_entry, sizeof(response) - strlen(response) - 1);
+                            }
+                        }
+                    }
+                }
+                closedir(dir);
+            }
+            
+            strncat(response, "\n", sizeof(response) - strlen(response) - 1);
+            sendto(COPY_SOCK, response, strlen(response), 0,
+                   (struct sockaddr *)&src_addr, src_len);
+            
+            LOG_INFO("Sent file list response: %s", response);
         }
         else {
             LOG_INFO("Unknown command received: %s", buffer);

@@ -35,6 +35,17 @@ typedef struct {
 } DSSInfo;
 
 typedef struct {
+    struct sockaddr_in dest;
+    char *request;
+    size_t request_len;
+    unsigned char **block_data;
+    size_t *block_size;
+    int stripe_num;
+    int disk_idx;
+    int success;
+} BlockReadTask;
+
+typedef struct {
     int disk_idx;
     char *block_data;
     size_t block_size;

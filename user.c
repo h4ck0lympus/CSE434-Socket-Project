@@ -273,6 +273,74 @@ static int copy_params(char *resp)
     return 0;
 }
 
+static void *read_block_thread(void *arg)
+{
+    BlockReadTask *task = (BlockReadTask *)arg;
+    if (!task) {
+        return NULL;
+    }
+
+    task->success = 0;
+    *(task->block_data) = NULL;
+    *(task->block_size) = 0;
+
+    ssize_t wr = sendto(COPY_SOCK, task->request, task->request_len, 0,
+                        (struct sockaddr *)&task->dest, sizeof(task->dest));
+    if (wr < 0) {
+        LOG_WARN("sendto failed while requesting stripe block");
+        return NULL;
+    }
+
+    const size_t buf_size = 2048 + 2 * 1024 * 1024;
+    unsigned char *buffer = (unsigned char *)malloc(buf_size);
+    if (!buffer) {
+        LOG_WARN("Failed to allocate read buffer");
+        return NULL;
+    }
+
+    struct sockaddr_in src_addr;
+    socklen_t src_len = sizeof(src_addr);
+    ssize_t recv_len = recvfrom(COPY_SOCK, buffer, buf_size, 0,
+                                (struct sockaddr *)&src_addr, &src_len);
+    if (recv_len < 0) {
+        LOG_WARN("recvfrom failed while reading stripe block");
+        free(buffer);
+        return NULL;
+    }
+
+    unsigned char *newline = memchr(buffer, '\n', (size_t)recv_len);
+    if (!newline) {
+        LOG_WARN("Malformed read response received");
+        free(buffer);
+        return NULL;
+    }
+
+    size_t header_len = (size_t)(newline - buffer);
+    size_t payload_len = (size_t)recv_len - header_len - 1;
+    buffer[header_len] = '\0';
+
+    char status[16];
+    if (sscanf((char *)buffer, "READ-RESPONSE %15s", status) != 1) {
+        LOG_WARN("Failed to parse READ response header");
+        free(buffer);
+        return NULL;
+    }
+
+    if (strcmp(status, "SUCCESS") == 0) {
+        *(task->block_data) = (unsigned char *)malloc(payload_len);
+        if (*(task->block_data)) {
+            memcpy(*(task->block_data), newline + 1, payload_len);
+            *(task->block_size) = payload_len;
+            task->success = 1;
+        }
+    } else {
+        LOG_WARN("Read failed for stripe %d disk %d", task->stripe_num, task->disk_idx);
+    }
+
+    free(buffer);
+    return NULL;
+}
+
 static int read_params(char *resp)
 {
     char dss[NAME_LEN];
@@ -357,56 +425,101 @@ static int read_params(char *resp)
     // read each stripe and reconstruct the file
     for (unsigned int s = 0; s < stripes; s++) {
         unsigned char *blocks[16];
-        int blocks_received = 0;
         
         // initialize block storage
         for (int i = 0; i < n; i++) {
             blocks[i] = NULL;
         }
 
-        // request blocks from each disk for this stripe
+        // create threads to request blocks from each disk for this stripe
+        pthread_t thread_ids[16];
+        BlockReadTask *tasks[16];
+        size_t block_sizes[16];
+        
+        for (int i = 0; i < n; i++) {
+            block_sizes[i] = 0;
+        }
+
         for (int d = 0; d < n; d++) {
             char request[256];
             int reqlen = snprintf(request, sizeof(request),
                                   "READ %s %s %u %u\n",
                                   dss, LAST_COPY_FILE, s, d);
-
-            // send read request to disk
-            if (sendto(COPY_SOCK, request, reqlen, 0,
-                       (struct sockaddr *)&peers[d].addr, sizeof(peers[d].addr)) < 0) {
-                LOG_WARN("Failed to send read request to disk %d", d);
-                continue;
-            }
-
-            // receive block data
-            const size_t buf_size = 2048 + 2 * 1024 * 1024;
-            unsigned char *buffer = (unsigned char *)malloc(buf_size);
-            if (!buffer) continue;
-
-            struct sockaddr_in src_addr;
-            socklen_t src_len = sizeof(src_addr);
-            ssize_t recv_len = recvfrom(COPY_SOCK, buffer, buf_size, 0,
-                                        (struct sockaddr *)&src_addr, &src_len);
-            
-            if (recv_len > 0) {
-                unsigned char *newline = memchr(buffer, '\n', recv_len);
-                if (newline) {
-                    size_t header_len = newline - buffer;
-                    size_t payload_len = recv_len - header_len - 1;
-                    buffer[header_len] = '\0';
-
-                    char status[16];
-                    if (sscanf((char *)buffer, "READ-RESPONSE %15s", status) == 1 && 
-                        strcmp(status, "SUCCESS") == 0) {
-                        blocks[d] = (unsigned char *)malloc(payload_len);
-                        if (blocks[d]) {
-                            memcpy(blocks[d], newline + 1, payload_len);
-                            blocks_received++;
-                        }
-                    }
+            if (reqlen < 0 || (size_t)reqlen >= sizeof(request)) {
+                LOG_WARN("Failed to construct read request");
+                for (int j = 0; j < d; j++) {
+                    pthread_join(thread_ids[j], NULL);
+                    free(tasks[j]->request);
+                    free(tasks[j]);
                 }
+                for (int j = 0; j < n; j++) {
+                    free(blocks[j]);
+                }
+                fclose(fp);
+                return -1;
             }
-            free(buffer);
+
+            BlockReadTask *task = (BlockReadTask *)malloc(sizeof(BlockReadTask));
+            if (!task) {
+                LOG_WARN("Failed to allocate read task");
+                for (int j = 0; j < d; j++) {
+                    pthread_join(thread_ids[j], NULL);
+                    free(tasks[j]->request);
+                    free(tasks[j]);
+                }
+                for (int j = 0; j < n; j++) {
+                    free(blocks[j]);
+                }
+                fclose(fp);
+                return -1;
+            }
+
+            task->dest = peers[d].addr;
+            task->request = (char *)malloc(reqlen);
+            if (!task->request) {
+                LOG_WARN("Failed to allocate request buffer");
+                free(task);
+                for (int j = 0; j < d; j++) {
+                    pthread_join(thread_ids[j], NULL);
+                    free(tasks[j]->request);
+                    free(tasks[j]);
+                }
+                for (int j = 0; j < n; j++) {
+                    free(blocks[j]);
+                }
+                fclose(fp);
+                return -1;
+            }
+            memcpy(task->request, request, reqlen);
+            task->request_len = reqlen;
+            task->block_data = &blocks[d];
+            task->block_size = &block_sizes[d];
+            task->stripe_num = s;
+            task->disk_idx = d;
+            tasks[d] = task;
+
+            if (pthread_create(&thread_ids[d], NULL, read_block_thread, task) != 0) {
+                LOG_WARN("Failed to spawn reader thread");
+                free(task->request);
+                free(task);
+                for (int j = 0; j < d; j++) {
+                    pthread_join(thread_ids[j], NULL);
+                    free(tasks[j]->request);
+                    free(tasks[j]);
+                }
+                for (int j = 0; j < n; j++) {
+                    free(blocks[j]);
+                }
+                fclose(fp);
+                return -1;
+            }
+        }
+
+        // wait for all read threads to complete
+        for (int t = 0; t < n; t++) {
+            pthread_join(thread_ids[t], NULL);
+            free(tasks[t]->request);
+            free(tasks[t]);
         }
 
         // reconstruct stripe data
@@ -481,6 +594,395 @@ static int read_params(char *resp)
     return 0;
 }
 
+static int failure_params(char *resp)
+{
+    char dss[NAME_LEN];
+    int n;
+    unsigned b;
+    if (sscanf(resp, "FAILURE-PARAMS %15s %d %u", dss, &n, &b) != 3) {
+        LOG_WARN("FAILED: FAILURE-PARAMS arguments not correct. response: %s", resp);
+        return -1;
+    }
+
+    if (n <= 0) {
+        LOG_WARN("Invalid disk count received in FAILURE-PARAMS");
+        return -1;
+    }
+
+    if (COPY_SOCK < 0) {
+        LOG_WARN("Copy socket not initialized");
+        return -1;
+    }
+
+    typedef struct {
+        char name[NAME_LEN];
+        char ip[16];
+        uint16_t cport;
+        struct sockaddr_in addr;
+    } Peer;
+
+    Peer peers[16];
+    if (n > (int)(sizeof(peers) / sizeof(peers[0]))) {
+        LOG_WARN("n is too big");
+        return -1;
+    }
+
+    // Parse disk information from FAILURE-PARAMS response
+    char *cursor = resp + 15; // skip FAILURE-PARAMS
+    for (int skip = 0; skip < 3 && *cursor; ) {
+        while (*cursor && *cursor != ' ') cursor++;
+        while (*cursor == ' ') cursor++;
+        skip++;
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (sscanf(cursor, "%15s %15s %hu",
+                   peers[i].name, peers[i].ip, &peers[i].cport) != 3) {
+            LOG_WARN("peer info incorrect format @ %d", i);
+            return -1;
+        }
+
+        for (int skip = 0; skip < 3 && *cursor; ) {
+            while (*cursor && *cursor != ' ') cursor++;
+            while (*cursor == ' ') cursor++;
+            skip++;
+        }
+
+        memset(&peers[i].addr, 0, sizeof(peers[i].addr));
+        peers[i].addr.sin_family = AF_INET;
+        if (inet_pton(AF_INET, peers[i].ip, &peers[i].addr.sin_addr) != 1) {
+            LOG_WARN("Invalid peer IP %s", peers[i].ip);
+            return -1;
+        }
+        peers[i].addr.sin_port = htons(peers[i].cport);
+    }
+
+    // Initialize random number generator if not already done
+    static int rng_initialized = 0;
+    if (!rng_initialized) {
+        srand((unsigned)time(NULL) ^ (unsigned)getpid());
+        rng_initialized = 1;
+    }
+    
+    // Randomly select a disk to fail (0 <= i < n)
+    int failed_disk = rand() % n;
+    LOG_INFO("Selected disk %d (%s) for failure simulation", failed_disk, peers[failed_disk].name);
+
+    // Send fail command to the selected disk
+    char fail_cmd[256];
+    snprintf(fail_cmd, sizeof(fail_cmd), "FAIL %s\n", dss);
+    
+    if (sendto(COPY_SOCK, fail_cmd, strlen(fail_cmd), 0,
+               (struct sockaddr *)&peers[failed_disk].addr, sizeof(peers[failed_disk].addr)) < 0) {
+        LOG_WARN("Failed to send fail command to disk %s", peers[failed_disk].name);
+        return -1;
+    }
+
+    // receive fail-complete response
+    const size_t buf_size = 1024;
+    char buffer[buf_size];
+    struct sockaddr_in src_addr;
+    socklen_t src_len = sizeof(src_addr);
+    ssize_t recv_len = recvfrom(COPY_SOCK, buffer, buf_size - 1, 0,
+                                (struct sockaddr *)&src_addr, &src_len);
+    
+    if (recv_len < 0) {
+        LOG_WARN("Failed to receive fail-complete response");
+        return -1;
+    }
+    
+    buffer[recv_len] = '\0';
+    if (strncmp(buffer, "FAIL-COMPLETE", 13) != 0) {
+        LOG_WARN("Unexpected response to fail command: %s", buffer);
+        return -1;
+    }
+
+    LOG_INFO("Disk failure simulation completed for disk %s", peers[failed_disk].name);
+
+    // now start recovery process according to specification
+    LOG_INFO("Starting recovery process for failed disk %d (%s)", failed_disk, peers[failed_disk].name);
+    
+    int working_disk = (failed_disk == 0) ? 1 : 0; // Pick any disk except failed one
+    
+    // create a simple protocol to get file list from a working disk
+    char list_cmd[256];
+    snprintf(list_cmd, sizeof(list_cmd), "LIST %s\n", dss);
+    
+    if (sendto(COPY_SOCK, list_cmd, strlen(list_cmd), 0,
+               (struct sockaddr *)&peers[working_disk].addr, sizeof(peers[working_disk].addr)) < 0) {
+        LOG_WARN("Failed to send LIST command to working disk");
+        return -1;
+    }
+    
+    const size_t list_buf_size = 4096;
+    char list_buffer[list_buf_size];
+    struct sockaddr_in list_src_addr;
+    socklen_t list_src_len = sizeof(list_src_addr);
+    ssize_t list_recv_len = recvfrom(COPY_SOCK, list_buffer, list_buf_size - 1, 0,
+                                     (struct sockaddr *)&list_src_addr, &list_src_len);
+
+    if (list_recv_len < 0) {
+        LOG_WARN("Failed to receive file list from working disk");
+        return -1;
+    }
+
+    list_buffer[list_recv_len] = '\0';
+    LOG_INFO("Received file list: %s", list_buffer);
+    
+    // parse file list and recover each file
+    // "FILE-LIST file1_stripes file2_stripes ..."
+    char *token = strtok(list_buffer, " \n");
+    if (!token || strcmp(token, "FILE-LIST") != 0) {
+        LOG_WARN("Invalid file list response");
+        return -1;
+    }
+    
+    // Process each file entry
+    while ((token = strtok(NULL, " \n")) != NULL) {
+        char file_name[NAME_LEN];
+        int num_stripes;
+        if (sscanf(token, "%15s_%d", file_name, &num_stripes) != 2) {
+            continue; // Skip invalid entries
+        }
+        
+        LOG_INFO("Recovering file %s with %d stripes", file_name, num_stripes);
+        
+        // Recover each stripe of this file
+        for (int stripe = 0; stripe < num_stripes; stripe++) {
+            // Read blocks from all working disks (D = {0,1,...,n} \ {failed_disk})
+            unsigned char *blocks[16];
+            pthread_t thread_ids[16];
+            BlockReadTask *tasks[16];
+            size_t block_sizes[16];
+            int working_count = 0;
+            
+            // Initialize storage
+            for (int d = 0; d < n; d++) {
+                blocks[d] = NULL;
+                block_sizes[d] = 0;
+            }
+            
+            // Create read threads for all working disks
+            for (int d = 0; d < n; d++) {
+                if (d == failed_disk) continue; // Skip failed disk
+                
+                char request[256];
+                int reqlen = snprintf(request, sizeof(request),
+                                      "READ %s %s %d %d\n",
+                                      dss, file_name, stripe, d);
+                
+                BlockReadTask *task = (BlockReadTask *)malloc(sizeof(BlockReadTask));
+                if (!task) continue;
+                
+                task->dest = peers[d].addr;
+                task->request = (char *)malloc(reqlen);
+                if (!task->request) {
+                    free(task);
+                    continue;
+                }
+                memcpy(task->request, request, reqlen);
+                task->request_len = reqlen;
+                task->block_data = &blocks[d];
+                task->block_size = &block_sizes[d];
+                task->stripe_num = stripe;
+                task->disk_idx = d;
+                tasks[working_count] = task;
+                
+                if (pthread_create(&thread_ids[working_count], NULL, read_block_thread, task) == 0) {
+                    working_count++;
+                }
+            }
+            
+            // Wait for all reads to complete
+            for (int t = 0; t < working_count; t++) {
+                pthread_join(thread_ids[t], NULL);
+                free(tasks[t]->request);
+                free(tasks[t]);
+            }
+            
+            // XOR all working blocks to recover failed block
+            unsigned char *recovered_block = (unsigned char *)malloc(b);
+            if (!recovered_block) {
+                for (int d = 0; d < n; d++) free(blocks[d]);
+                continue;
+            }
+            
+            memset(recovered_block, 0, b);
+            for (int d = 0; d < n; d++) {
+                if (d != failed_disk && blocks[d]) {
+                    for (unsigned k = 0; k < b; k++) {
+                        recovered_block[k] ^= blocks[d][k];
+                    }
+                }
+            }
+            
+            // Determine if recovered block is DATA or PARITY
+            unsigned int parity_disk = (unsigned int)n - ((stripe % (unsigned int)n) + 1);
+            if (parity_disk >= (unsigned int)n) parity_disk = 0;
+            
+            const char *block_type = ((unsigned int)failed_disk == parity_disk) ? "PARITY" : "DATA";
+            
+            // Send recovered block to failed disk
+            char write_header[256];
+            int hdr_len = snprintf(write_header, sizeof(write_header),
+                                   "WRITE %s %s %d %d %s %u\n",
+                                   dss, file_name, stripe, failed_disk, block_type, b);
+            
+            size_t total_size = hdr_len + b;
+            unsigned char *write_packet = (unsigned char *)malloc(total_size);
+            if (write_packet) {
+                memcpy(write_packet, write_header, hdr_len);
+                memcpy(write_packet + hdr_len, recovered_block, b);
+                
+                sendto(COPY_SOCK, write_packet, total_size, 0,
+                       (struct sockaddr *)&peers[failed_disk].addr, sizeof(peers[failed_disk].addr));
+                
+                free(write_packet);
+            }
+            
+            free(recovered_block);
+            for (int d = 0; d < n; d++) free(blocks[d]);
+            
+            LOG_INFO("Recovered stripe %d of file %s (%s block)", stripe, file_name, block_type);
+        }
+        
+        LOG_INFO("Completed recovery of file %s", file_name);
+    }
+    
+    LOG_INFO("Recovery process completed for failed disk %d", failed_disk);
+    
+    const char *rc = "recovery-complete";
+    if (sendto(MANAGER_SOCK, rc, strlen(rc), 0,
+               (struct sockaddr *)&MANAGER_ADDR, sizeof(MANAGER_ADDR)) < 0) {
+        LOG_WARN("Failed to send recovery-complete to manager");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int decommission_params(char *resp)
+{
+    char dss[NAME_LEN];
+    int n;
+    unsigned b;
+    if (sscanf(resp, "DECOMMISSION-PARAMS %15s %d %u", dss, &n, &b) != 3) {
+        LOG_WARN("FAILED: DECOMMISSION-PARAMS arguments not correct. response: %s", resp);
+        return -1;
+    }
+
+    if (n <= 0) {
+        LOG_WARN("Invalid disk count received in DECOMMISSION-PARAMS");
+        return -1;
+    }
+
+    if (COPY_SOCK < 0) {
+        LOG_WARN("Copy socket not initialized");
+        return -1;
+    }
+
+    typedef struct {
+        char name[NAME_LEN];
+        char ip[16];
+        uint16_t cport;
+        struct sockaddr_in addr;
+    } Peer;
+
+    Peer peers[16];
+    if (n > (int)(sizeof(peers) / sizeof(peers[0]))) {
+        LOG_WARN("n is too big");
+        return -1;
+    }
+
+    // parse disk information from DECOMMISSION-PARAMS response
+    char *cursor = resp + 20; // skip DECOMMISSION-PARAMS
+    for (int skip = 0; skip < 3 && *cursor; ) {
+        while (*cursor && *cursor != ' ') cursor++;
+        while (*cursor == ' ') cursor++;
+        skip++;
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (sscanf(cursor, "%15s %15s %hu",
+                   peers[i].name, peers[i].ip, &peers[i].cport) != 3) {
+            LOG_WARN("peer info incorrect format @ %d", i);
+            return -1;
+        }
+
+        for (int skip = 0; skip < 3 && *cursor; ) {
+            while (*cursor && *cursor != ' ') cursor++;
+            while (*cursor == ' ') cursor++;
+            skip++;
+        }
+
+        memset(&peers[i].addr, 0, sizeof(peers[i].addr));
+        peers[i].addr.sin_family = AF_INET;
+        if (inet_pton(AF_INET, peers[i].ip, &peers[i].addr.sin_addr) != 1) {
+            LOG_WARN("Invalid peer IP %s", peers[i].ip);
+            return -1;
+        }
+        peers[i].addr.sin_port = htons(peers[i].cport);
+    }
+
+    LOG_INFO("Starting decommission process for DSS %s with %d disks", dss, n);
+    
+    // send FAIL command to ALL disks in the DSS
+    for (int i = 0; i < n; i++) {
+        char fail_cmd[256];
+        snprintf(fail_cmd, sizeof(fail_cmd), "FAIL %s\n", dss);
+        
+        if (sendto(COPY_SOCK, fail_cmd, strlen(fail_cmd), 0,
+                   (struct sockaddr *)&peers[i].addr, sizeof(peers[i].addr)) < 0) {
+            LOG_WARN("Failed to send fail command to disk %s", peers[i].name);
+            continue;
+        }
+        
+        LOG_INFO("Sent FAIL command to disk %s (%s:%hu)", 
+                 peers[i].name, peers[i].ip, peers[i].cport);
+    }
+    
+    // receive fail-complete responses from all disks
+    int completed_disks = 0;
+    for (int i = 0; i < n; i++) {
+        const size_t buf_size = 1024;
+        char buffer[buf_size];
+        struct sockaddr_in src_addr;
+        socklen_t src_len = sizeof(src_addr);
+        ssize_t recv_len = recvfrom(COPY_SOCK, buffer, buf_size - 1, 0,
+                                    (struct sockaddr *)&src_addr, &src_len);
+        
+        if (recv_len < 0) {
+            LOG_WARN("Failed to receive fail-complete response from disk %d", i);
+            continue;
+        }
+        
+        buffer[recv_len] = '\0';
+        if (strncmp(buffer, "FAIL-COMPLETE", 13) == 0) {
+            completed_disks++;
+            LOG_INFO("Received FAIL-COMPLETE from disk (total: %d/%d)", completed_disks, n);
+        } else {
+            LOG_WARN("Unexpected response from disk: %s", buffer);
+        }
+    }
+    
+    if (completed_disks == n) {
+        LOG_INFO("All %d disks completed failure simulation for DSS %s", n, dss);
+    } else {
+        LOG_WARN("Only %d out of %d disks completed failure simulation", completed_disks, n);
+    }
+    
+    // send decommission-complete to manager
+    const char *dc = "decommission-complete";
+    if (sendto(MANAGER_SOCK, dc, strlen(dc), 0,
+               (struct sockaddr *)&MANAGER_ADDR, sizeof(MANAGER_ADDR)) < 0) {
+        LOG_WARN("Failed to send decommission-complete to manager");
+        return -1;
+    }
+
+    LOG_INFO("Decommission process completed for DSS %s", dss);
+    return 0;
+}
+
 int receive_cmd(char *cmd_buffer, char *local_ip)
 {
     printf("\nAvailable commands:\n");
@@ -489,6 +991,8 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
     printf("  configure-dss <dss-name> <n> <striping-unit>\n");
     printf("  copy <file-name> <file-size> <owner>\n");
     printf("  read <dss-name> <file-name> <user-name>\n");
+    printf("  disk-failure <dss-name>\n");
+    printf("  decommission-dss <dss-name>\n");
     printf("  ls\n");
     printf("  exit\n\n");
     printf("user-%s> ", USERNAME);
@@ -537,11 +1041,29 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
         char file_name[NAME_LEN];
         char user_name[NAME_LEN];
         if (sscanf(line, "read %15s %15s %15s", dss_name, file_name, user_name) == 3) {
-            snprintf(cmd_buffer, COMMAND_SIZE, "read %s %s", file_name, user_name);
+            snprintf(cmd_buffer, COMMAND_SIZE, "read %s %s %s", dss_name, file_name, user_name);
             strncpy(LAST_COPY_FILE, file_name, NAME_LEN - 1);
             LAST_COPY_FILE[NAME_LEN - 1] = '\0';
         } else {
             LOG_WARN("Unknown command format for read");
+            free(line);
+            return -1;
+        }
+    } else if (strncmp(line, "disk-failure", 12) == 0) {
+        char dss_name[NAME_LEN];
+        if (sscanf(line, "disk-failure %15s", dss_name) == 1) {
+            snprintf(cmd_buffer, COMMAND_SIZE, "disk-failure %s", dss_name);
+        } else {
+            LOG_WARN("Unknown command format for disk-failure");
+            free(line);
+            return -1;
+        }
+    } else if (strncmp(line, "decommission-dss", 16) == 0) {
+        char dss_name[NAME_LEN];
+        if (sscanf(line, "decommission-dss %15s", dss_name) == 1) {
+            snprintf(cmd_buffer, COMMAND_SIZE, "decommission-dss %s", dss_name);
+        } else {
+            LOG_WARN("Unknown command format for decommission-dss");
             free(line);
             return -1;
         }
@@ -674,6 +1196,46 @@ int main(int argc, char* argv[])
                 }
             } else {
                 printf("[response]: FAILURE: Read aborted locally [src ip]: %s\n",
+                       inet_ntoa(src_addr.sin_addr));
+            }
+            continue;
+        }
+
+        if (strncmp(response, "FAILURE-PARAMS ", 15) == 0) {
+            if (failure_params(response) == 0) {
+                if ((resp_len = recvfrom(MANAGER_SOCK, response, RESPONSE_SIZE - 1, 0,
+                                         (struct sockaddr*)&src_addr, &src_len)) < 0) {
+                    LOG_ERROR("failed to receive post-failure response");
+                } else {
+                    response[resp_len] = '\0';
+                    if (MANAGER_ADDR.sin_addr.s_addr != src_addr.sin_addr.s_addr) {
+                        LOG_ERROR("Received response from unknown source. MITM possible. Halting");
+                    } else {
+                        printf("[response]: %s [src ip]: %s\n", response, inet_ntoa(src_addr.sin_addr));
+                    }
+                }
+            } else {
+                printf("[response]: FAILURE: Disk failure aborted locally [src ip]: %s\n",
+                       inet_ntoa(src_addr.sin_addr));
+            }
+            continue;
+        }
+
+        if (strncmp(response, "DECOMMISSION-PARAMS ", 20) == 0) {
+            if (decommission_params(response) == 0) {
+                if ((resp_len = recvfrom(MANAGER_SOCK, response, RESPONSE_SIZE - 1, 0,
+                                         (struct sockaddr*)&src_addr, &src_len)) < 0) {
+                    LOG_ERROR("failed to receive post-decommission response");
+                } else {
+                    response[resp_len] = '\0';
+                    if (MANAGER_ADDR.sin_addr.s_addr != src_addr.sin_addr.s_addr) {
+                        LOG_ERROR("Received response from unknown source. MITM possible. Halting");
+                    } else {
+                        printf("[response]: %s [src ip]: %s\n", response, inet_ntoa(src_addr.sin_addr));
+                    }
+                }
+            } else {
+                printf("[response]: FAILURE: Decommission aborted locally [src ip]: %s\n",
                        inet_ntoa(src_addr.sin_addr));
             }
             continue;

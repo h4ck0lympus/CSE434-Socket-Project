@@ -18,6 +18,8 @@ static int g_rng_seeded = 0;
 
 static PendingCopy pending_copy = {0};
 static PendingRead pending_read = {0};
+static PendingDiskFailure pending_failure = {0};
+static PendingDecommission pending_decommission = {0};
 
 static int is_power_of_two(uint32_t n)
 {
@@ -319,6 +321,113 @@ int read_file(char* file_name, char* user_name) {
     return -2;
 }
 
+int disk_failure(char* dss_name) {
+    if (dss_count == 0) {
+        LOG_WARN("No DSSs configured for disk-failure operation");
+        return -1;
+    }
+
+    if (pending_read.active) {
+        LOG_WARN("Read operation in progress, disk-failure not allowed");
+        return -2;
+    }
+
+    int dss_idx = -1;
+    for (int i = 0; i < dss_count; i++) {
+        if (strcmp(dss_list[i].name, dss_name) == 0) {
+            dss_idx = i;
+            break;
+        }
+    }
+
+    if (dss_idx < 0) {
+        LOG_WARN("DSS %s not found", dss_name);
+        return -3;
+    }
+
+    strncpy(pending_failure.dss_name, dss_name, NAME_LEN - 1);
+    pending_failure.dss_name[NAME_LEN - 1] = '\0';
+    pending_failure.dss_idx = dss_idx;
+    pending_failure.is_pending = 1;
+
+    LOG_INFO("Phase 1: Disk failure initiated for DSS %s", dss_name);
+    return dss_idx;
+}
+
+int decommission_dss(char* dss_name) {
+    if (dss_count == 0) {
+        LOG_WARN("No DSSs configured for decommission operation");
+        return -1;
+    }
+
+    int dss_idx = -1;
+    for (int i = 0; i < dss_count; i++) {
+        if (strcmp(dss_list[i].name, dss_name) == 0) {
+            dss_idx = i;
+            break;
+        }
+    }
+
+    if (dss_idx < 0) {
+        LOG_WARN("DSS %s not found", dss_name);
+        return -2;
+    }
+
+    strncpy(pending_decommission.dss_name, dss_name, NAME_LEN - 1);
+    pending_decommission.dss_name[NAME_LEN - 1] = '\0';
+    pending_decommission.dss_idx = dss_idx;
+    pending_decommission.is_pending = 1;
+
+    LOG_INFO("Decommission initiated for DSS %s (critical section active)", dss_name);
+    return dss_idx;
+}
+
+static int decommission_response(int dss_idx, char* out, size_t outlen)
+{
+    DSS* dss = &dss_list[dss_idx];
+    size_t off = 0;
+
+    int w = snprintf(out + off, outlen - off, "DECOMMISSION-PARAMS %s %d %u",
+                     dss->name, dss->n, dss->striping_unit);
+
+    if (w < 0 || (size_t)w >= outlen - off)
+        return -1;
+    off += w;
+
+    for (int i=0; i < dss->n; i++) {
+        int di = dss->disk_indices[i];
+        w = snprintf(out + off, outlen-off, " %s %s %hu",
+                 disks[di].name, disks[di].ipv4_addr, disks[di].cport);
+        if (w < 0 || (size_t)w >= outlen - off)
+            return -1;
+        off+=w;
+    }
+    return 0;
+}
+
+static int failure_response(int dss_idx, char* out, size_t outlen)
+{
+    DSS* dss = &dss_list[dss_idx];
+    size_t off = 0;
+
+    int w = snprintf(out + off, outlen - off, "FAILURE-PARAMS %s %d %u",
+                     dss->name, dss->n, dss->striping_unit);
+
+    if (w < 0 || (size_t)w >= outlen - off)
+        return -1;
+    off += w;
+
+    for (int i=0; i < dss->n; i++) {
+        int di = dss->disk_indices[i];
+        w = snprintf(out + off, outlen-off, " %s %s %hu",
+                 disks[di].name, disks[di].ipv4_addr, disks[di].cport);
+        if (w < 0 || (size_t)w >= outlen - off)
+            return -1;
+        off+=w;
+    }
+    return 0;
+}
+
 static int read_response(int dss_idx, char* out, size_t outlen)
 {
     DSS* dss = &dss_list[dss_idx];
@@ -379,6 +488,18 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
     // check if read operation is pending, if it is then read-complete is only allowed
     if (pending_read.active && strncmp(cmd, "read-complete", 13) != 0) {
         strcpy(response, "FAILURE: Read operation in progress, only read-complete allowed");
+        goto send_response;
+    }
+    
+    // check if disk failure operation is pending, if it is then recovery-complete is only allowed
+    if (pending_failure.is_pending && strncmp(cmd, "recovery-complete", 17) != 0) {
+        strcpy(response, "FAILURE: Disk failure operation in progress, only recovery-complete allowed");
+        goto send_response;
+    }
+    
+    // check if decommission operation is pending, block ALL commands except decommission-complete
+    if (pending_decommission.is_pending && strncmp(cmd, "decommission-complete", 21) != 0) {
+        strcpy(response, "FAILURE: Decommission operation in progress (critical section)");
         goto send_response;
     }
     
@@ -445,9 +566,9 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
         }
     } else if (strncmp(cmd, "ls", 2) == 0) {
-        if (ls(response, sizeof(response)) == 0) {
-            strcpy(response, "SUCCESS\n");
-            ls(response + 8, sizeof(response) - 8);
+        char temp[4096];
+        if (ls(temp, sizeof(temp)) == 0) {
+            snprintf(response, sizeof(response), "SUCCESS\n%s", temp);
         } else {
             strcpy(response, "FAILURE: No DSSs configured");
         }
@@ -490,19 +611,44 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
             strcpy(response, "SUCCESS: copy-complete");
         }
     } else if (strncmp(cmd, "read ", 5) == 0) {
-        char file_name[NAME_LEN];
-        char user_name[NAME_LEN];
-        if (sscanf(cmd, "read %s %s", file_name, user_name) == 2) {
-            int resp_code = read_file(file_name, user_name);
-            if (resp_code >= 0) {
-                if (read_response(resp_code, response, sizeof(response)) != 0) {
-                    pending_read.active = 0;
-                    strcpy(response, "FAILURE: Response too large");
+        char dss_name[NAME_LEN], file_name[NAME_LEN], user_name[NAME_LEN];
+        if (sscanf(cmd, "read %15s %15s %15s", dss_name, file_name, user_name) == 3) {
+            // find dss
+            int dss_idx = -1;
+            for (int i = 0; i < dss_count; i++) {
+                if (strcmp(dss_list[i].name, dss_name) == 0) {
+                    dss_idx = i;
+                    break;
                 }
-            } else if (resp_code == -1) {
-                strcpy(response, "FAILURE: No DSSs configured");
-            } else if (resp_code == -2) {
-                strcpy(response, "FAILURE: File not found");
+            }
+            if (dss_idx < 0) {
+                strcpy(response, "FAILURE: DSS not found");
+                goto send_response;
+            }
+            // find file in dss and check owner
+            DSS *dss = &dss_list[dss_idx];
+            int file_found = 0;
+            for (int j = 0; j < dss->file_count; j++) {
+                if (strcmp(dss->files[j].name, file_name) == 0 && strcmp(dss->files[j].owner, user_name) == 0) {
+                    file_found = 1;
+                    pending_read.size = dss->files[j].size;
+                    break;
+                }
+            }
+            if (!file_found) {
+                strcpy(response, "FAILURE: File not found or access denied");
+                goto send_response;
+            }
+            // set pending
+            pending_read.active = 1;
+            pending_read.dss_idx = dss_idx;
+            strncpy(pending_read.file, file_name, NAME_LEN - 1);
+            pending_read.file[NAME_LEN - 1] = '\0';
+            strncpy(pending_read.user, user_name, NAME_LEN - 1);
+            pending_read.user[NAME_LEN - 1] = '\0';
+            if (read_response(dss_idx, response, sizeof(response)) != 0) {
+                pending_read.active = 0;
+                strcpy(response, "FAILURE: Response too large");
             }
         } else {
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
@@ -516,6 +662,77 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
             
             pending_read.active = 0;
             strcpy(response, "SUCCESS: read-complete");
+        }
+    } else if (strncmp(cmd, "disk-failure ", 13) == 0) {
+        char dss_name[NAME_LEN];
+        if (sscanf(cmd, "disk-failure %s", dss_name) == 1) {
+            int resp_code = disk_failure(dss_name);
+            if (resp_code >= 0) {
+                if (failure_response(resp_code, response, sizeof(response)) != 0) {
+                    pending_failure.is_pending = 0;
+                    strcpy(response, "FAILURE: Response too large");
+                }
+            } else if (resp_code == -1) {
+                strcpy(response, "FAILURE: No DSSs configured");
+            } else if (resp_code == -2) {
+                strcpy(response, "FAILURE: Read operation in progress");
+            } else if (resp_code == -3) {
+                strcpy(response, "FAILURE: DSS not found");
+            }
+        } else {
+            strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
+        }
+    } else if (strncmp(cmd, "recovery-complete", 17) == 0) {
+        if (!pending_failure.is_pending) {
+            strcpy(response, "FAILURE: No pending disk failure operation");
+        } else {
+            LOG_INFO("Phase 2: Disk failure recovery completed for DSS %s", 
+                     pending_failure.dss_name);
+            
+            pending_failure.is_pending = 0;
+            strcpy(response, "SUCCESS: recovery-complete");
+        }
+    } else if (strncmp(cmd, "decommission-dss ", 17) == 0) {
+        char dss_name[NAME_LEN];
+        if (sscanf(cmd, "decommission-dss %s", dss_name) == 1) {
+            int resp_code = decommission_dss(dss_name);
+            if (resp_code >= 0) {
+                if (decommission_response(resp_code, response, sizeof(response)) != 0) {
+                    pending_decommission.is_pending = 0;
+                    strcpy(response, "FAILURE: Response too large");
+                }
+            } else if (resp_code == -1) {
+                strcpy(response, "FAILURE: No DSSs configured");
+            } else if (resp_code == -2) {
+                strcpy(response, "FAILURE: DSS not found");
+            }
+        } else {
+            strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
+        }
+    } else if (strncmp(cmd, "decommission-complete", 21) == 0) {
+        if (!pending_decommission.is_pending) {
+            strcpy(response, "FAILURE: No pending decommission operation");
+        } else {
+            // free all disks in this DSS (change state from IN_DSS to FREE)
+            DSS *dss = &dss_list[pending_decommission.dss_idx];
+            for (int i = 0; i < dss->n; i++) {
+                int disk_idx = dss->disk_indices[i];
+                disks[disk_idx].state = FREE;
+                memset(disks[disk_idx].dss_name, 0, NAME_LEN);
+                LOG_INFO("Disk %s changed from IN_DSS to FREE", disks[disk_idx].name);
+            }
+            
+            // remove DSS from manager state
+            for (int i = pending_decommission.dss_idx; i < dss_count - 1; i++) {
+                dss_list[i] = dss_list[i + 1];
+            }
+            dss_count--;
+            
+            LOG_INFO("DSS %s decommissioned and removed from manager state", 
+                     pending_decommission.dss_name);
+            
+            pending_decommission.is_pending = 0;
+            strcpy(response, "SUCCESS: decommission-complete");
         }
     } else {
         LOG_WARN("Unknown command: %s", cmd);

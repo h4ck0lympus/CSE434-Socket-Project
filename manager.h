@@ -74,6 +74,18 @@ typedef struct {
     size_t size;
 } PendingRead;
 
+typedef struct {
+    char dss_name[NAME_LEN];
+    int dss_idx;
+    int is_pending;
+} PendingDiskFailure;
+
+typedef struct {
+    char dss_name[NAME_LEN];
+    int dss_idx;
+    int is_pending;
+} PendingDecommission;
+
 // command handler that will handle the incoming commands
 // return 0 is success else -1
 int command_handler(char *, struct sockaddr_in*, socklen_t);
@@ -93,5 +105,9 @@ int ls(char* response_buffer, size_t buffer_size);
 int copy(char* file_name, int file_size, char* owner);
 
 int read_file(char* file_name, char* user_name);
+
+int disk_failure(char* dss_name);
+
+int decommission_dss(char* dss_name);
 
 #endif // MANAGER_H
