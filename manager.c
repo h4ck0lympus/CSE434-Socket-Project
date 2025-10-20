@@ -49,23 +49,23 @@ static void init_rng(void) {
 int register_user(char* name, char* ip, uint16_t mport, uint16_t cport)
 {
     if (user_count >= MAX_PEERS) { 
-        LOG_INFO("Too many users");
+        LOG_WARN("Too many users");
         return -1; 
     }
 
     if (!valid_ports(mport, cport)) { 
-        LOG_INFO("Port conflict or mport==cport"); 
+        LOG_WARN("Port conflict or mport==cport"); 
         return -1; 
     }
 
     for (int i=0; i < user_count; i++) {
         if (strcmp(users[i].name, name) == 0) {
-            LOG_INFO("User %s already registered", name);
+            LOG_WARN("User %s already registered", name);
             return -1;
         }
 
         if (users[i].mport == mport || users[i].cport == cport) {
-            LOG_INFO("Port already in use");
+            LOG_WARN("Port already in use");
             return -1;
         }
     }
@@ -83,22 +83,22 @@ int register_user(char* name, char* ip, uint16_t mport, uint16_t cport)
 int register_disk(char* name, char* ip, uint16_t mport, uint16_t cport)
 {
     if (disk_count >= MAX_PEERS) { 
-        LOG_INFO("Too many disks"); 
+        LOG_WARN("Too many disks"); 
         return -1; 
     }
 
     if (!valid_ports(mport, cport)) {
-        LOG_INFO("Port conflict or mport==cport"); 
+        LOG_WARN("Port conflict or mport==cport"); 
         return -1; 
     }
 
     for (int i = 0; i < disk_count; i++) {
         if (strcmp(disks[i].name, name) == 0) {
-            LOG_INFO("Disk %s already registered", name);
+            LOG_WARN("Disk %s already registered", name);
             return -1;
         }
         if (disks[i].mport == mport || disks[i].cport == cport) {
-            LOG_INFO("Port already in use");
+            LOG_WARN("Port already in use");
             return -1;
         }
     }
@@ -118,20 +118,20 @@ int register_disk(char* name, char* ip, uint16_t mport, uint16_t cport)
 int configure_dss(char *dss_name, int n, uint32_t striping_unit) {
     // basic checks
     if (n < 3) {
-        LOG_INFO("DSS configuration failed: n must be >= 3");
+        LOG_WARN("DSS configuration failed: n must be >= 3");
         return -1;
     }
     if (!is_power_of_two(striping_unit) || striping_unit < 128 || striping_unit > 1048576) {
-        LOG_INFO("DSS configuration failed: invalid striping unit");
+        LOG_WARN("DSS configuration failed: invalid striping unit");
         return -1;
     }
     if (dss_count >= MAX_DSS) {
-        LOG_INFO("DSS configuration failed: max DSS reached");
+        LOG_WARN("DSS configuration failed: max DSS reached");
         return -1;
     }
     for (int i = 0; i < dss_count; i++) {
         if (strcmp(dss_list[i].name, dss_name) == 0) {
-            LOG_INFO("DSS %s already exists", dss_name);
+            LOG_WARN("DSS %s already exists", dss_name);
             return -1;
         }
     }
@@ -144,7 +144,7 @@ int configure_dss(char *dss_name, int n, uint32_t striping_unit) {
         }
     }
     if (free_count < n) {
-        LOG_INFO("Insufficient free disks: need %d, have %d", n, free_count);
+        LOG_WARN("Insufficient free disks: need %d, have %d", n, free_count);
         return -1;
     }
 
@@ -193,7 +193,7 @@ int deregister_user(char *name)
             return 0;
         }
     }
-    LOG_INFO("User %s not found", name);
+    LOG_WARN("User %s not found", name);
     return -1;
 }
 
@@ -202,7 +202,7 @@ int deregister_disk(char *name)
     for (int i = 0; i < disk_count; i++) {
         if (strcmp(disks[i].name, name) == 0) {
             if (disks[i].state == IN_DSS) {
-                LOG_INFO("Disk %s is in DSS %s, cannot deregister", 
+                LOG_WARN("Disk %s is in DSS %s, cannot deregister", 
                         name, disks[i].dss_name);
                 return -1;
             }
@@ -214,7 +214,7 @@ int deregister_disk(char *name)
             return 0;
         }
     }
-    LOG_INFO("Disk %s not found", name);
+    LOG_WARN("Disk %s not found", name);
     return -1;
 }
 
@@ -257,7 +257,7 @@ int ls(char* response_buffer, size_t buffer_size)
 
 int copy(char* file_name, int file_size, char* owner) {
     if (dss_count == 0) {
-        LOG_INFO("No DSSs configured for copy operation");
+        LOG_WARN("No DSSs configured for copy operation");
         return -1;
     }
 
@@ -270,7 +270,7 @@ int copy(char* file_name, int file_size, char* owner) {
     }
 
     if (selected_dss_idx < 0) {
-        LOG_INFO("No DSS is empty for the file");
+        LOG_WARN("No DSS is empty for the file");
         return -2;
     }
 
@@ -432,7 +432,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
             strcpy(response, "SUCCESS: copy-complete");
         }
     } else {
-        LOG_INFO("Unknown command: %s", cmd);
+        LOG_WARN("Unknown command: %s", cmd);
     }
 
 send_response:

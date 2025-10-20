@@ -5,6 +5,9 @@
 #define LOG_INFO(msg, ...) \
     fprintf(stderr, "[INFO] %s:%d: " msg "\n", __FILE__, __LINE__, ##__VA_ARGS__)
 
+#define LOG_WARN(msg, ...) \
+    fprintf(stderr, "[WARN] %s:%d: " msg "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+
 #define LOG_DEBUG(msg, ...) \
     fprintf(stderr, "[DEBUG] %s:%d:%s(): " msg "\n", __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 

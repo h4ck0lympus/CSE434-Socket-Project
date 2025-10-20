@@ -11,6 +11,9 @@ static struct sockaddr_in MANAGER_ADDR;
 static uint16_t MPORT;
 static uint16_t CPORT;
 
+static int MANAGER_SOCK = -1;
+static int COPY_SOCK = -1;
+
 static char LAST_COPY_FILE[NAME_LEN];
 static unsigned int LAST_COPY_SIZE;
 static char LAST_COPY_OWNER[NAME_LEN];
@@ -49,23 +52,50 @@ int get_local_ip(char *buffer, size_t buflen) {
     return found ? 0 : -1;
 }
 
-static void copy_params(char* resp, int sock)
+typedef struct {
+    struct sockaddr_in dest;
+    unsigned char *packet;
+    size_t packet_len;
+} BlockSendTask;
+
+static void *send_block_thread(void *arg)
 {
-    char dss[NAME_LEN]; 
+    BlockSendTask *task = (BlockSendTask *)arg;
+    if (!task) {
+        return NULL;
+    }
+
+    ssize_t wr = sendto(COPY_SOCK, task->packet, task->packet_len, 0,
+                        (struct sockaddr *)&task->dest, sizeof(task->dest));
+    if (wr < 0) {
+        LOG_WARN("sendto failed while writing stripe block");
+    } else if ((size_t)wr != task->packet_len) {
+        LOG_WARN("Partial send while writing stripe block");
+    }
+
+    free(task->packet);
+    free(task);
+    return NULL;
+}
+
+static int copy_params(char *resp)
+{
+    char dss[NAME_LEN];
     int n;
     unsigned b;
-    if (sscanf(resp, "COPY-PARAMS %s %d %u", dss, &n, &b) != 3) {
-        LOG_INFO("FAILED: COPY-PARAMS arguments not correct. response: %s", resp);
-        return;
+    if (sscanf(resp, "COPY-PARAMS %15s %d %u", dss, &n, &b) != 3) {
+        LOG_WARN("FAILED: COPY-PARAMS arguments not correct. response: %s", resp);
+        return -1;
     }
-    
-    resp += 12; // skip COPY-PARAMS
 
-    // skip "%s %d %u"
-    for (int t=0; t<3; ) {
-        while (*resp && *resp != ' ') resp++;
-        while (*resp == ' ') resp++;
-        t++;
+    if (n <= 0) {
+        LOG_WARN("Invalid disk count received in COPY-PARAMS");
+        return -1;
+    }
+
+    if (COPY_SOCK < 0) {
+        LOG_WARN("Copy socket not initialized");
+        return -1;
     }
 
     typedef struct {
@@ -76,103 +106,156 @@ static void copy_params(char* resp, int sock)
     } Peer;
 
     Peer peers[16];
-    if (n > 16) {
-        LOG_INFO("n is too big");
-        return;
+    if (n > (int)(sizeof(peers) / sizeof(peers[0]))) {
+        LOG_WARN("n is too big");
+        return -1;
     }
 
-    for (int i=0; i < n; i++) {
-        if (sscanf(resp, "%s %15s %hu", 
+    char *cursor = resp + 12; // skip COPY-PARAMS
+    for (int skip = 0; skip < 3 && *cursor; ) {
+        while (*cursor && *cursor != ' ') cursor++;
+        while (*cursor == ' ') cursor++;
+        skip++;
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (sscanf(cursor, "%15s %15s %hu",
                    peers[i].name, peers[i].ip, &peers[i].cport) != 3) {
-            LOG_INFO("peer info incorrect format @ %d", i);
-            return;
+            LOG_WARN("peer info incorrect format @ %d", i);
+            return -1;
         }
 
-        // skip "%s %d %u"
-        for (int t=0; t<3; ) {
-            while (*resp && *resp != ' ') resp++;
-            while (*resp == ' ') resp++;
-            t++;
+        for (int skip = 0; skip < 3 && *cursor; ) {
+            while (*cursor && *cursor != ' ') cursor++;
+            while (*cursor == ' ') cursor++;
+            skip++;
         }
 
         memset(&peers[i].addr, 0, sizeof(peers[i].addr));
         peers[i].addr.sin_family = AF_INET;
-        inet_pton(AF_INET, peers[i].ip, &peers[i].addr.sin_addr);
+        if (inet_pton(AF_INET, peers[i].ip, &peers[i].addr.sin_addr) != 1) {
+            LOG_WARN("Invalid peer IP %s", peers[i].ip);
+            return -1;
+        }
         peers[i].addr.sin_port = htons(peers[i].cport);
     }
 
-    // open the source file
-    FILE* fp = fopen(LAST_COPY_FILE, "rb");
+    FILE *fp = fopen(LAST_COPY_FILE, "rb");
     if (!fp) {
-        LOG_ERROR("fopen %s failed", LAST_COPY_FILE);
+        LOG_WARN("fopen %s failed", LAST_COPY_FILE);
+        return -1;
     }
 
     unsigned int file_size = LAST_COPY_SIZE;
-    unsigned int blocks_per_stripe = n - 1;
+    unsigned int blocks_per_stripe = (unsigned int)n - 1;
+    if (blocks_per_stripe == 0) {
+        LOG_WARN("Invalid stripe configuration: no data blocks available");
+        fclose(fp);
+        return -1;
+    }
     unsigned int stripe_bytes = blocks_per_stripe * b;
-    unsigned int stripes = (file_size + stripe_bytes -1 ) / stripe_bytes;
+    unsigned int stripes = (file_size + stripe_bytes - 1) / stripe_bytes;
 
-    unsigned char* stripe = malloc(stripe_bytes);
-    unsigned char* parity = malloc(b);
-
-    int p2p_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (p2p_sock < 0) {
-        LOG_ERROR("Failed to open p2p UDP socket");
+    if (stripes == 0) {
+        stripes = 1;
     }
 
+    unsigned char *stripe = (unsigned char *)malloc(stripe_bytes);
+    unsigned char *parity = (unsigned char *)malloc(b);
+    if (!stripe || !parity) {
+        LOG_WARN("Failed to allocate stripe buffers");
+        free(stripe);
+        free(parity);
+        fclose(fp);
+        return -1;
+    }
 
-    for (unsigned int s=0; s<stripes; s++) {
+    for (unsigned int s = 0; s < stripes; s++) {
         size_t need = stripe_bytes;
         size_t got = fread(stripe, 1, stripe_bytes, fp);
-        // handle the padding of null bytes
         if (got < need) {
-            memset(stripe+got, 0, need-got);
+            memset(stripe + got, 0, need - got);
         }
 
-        // parity = XOR of (n-1) blocks, each size b
         memset(parity, 0, b);
-        for (unsigned int j=0; j < blocks_per_stripe; j++) {
-            unsigned char* blk = stripe + j*b;
-            for (unsigned k=0; k < b; k++) {
+        for (unsigned int j = 0; j < blocks_per_stripe; j++) {
+            unsigned char *blk = stripe + j * b;
+            for (unsigned k = 0; k < b; k++) {
                 parity[k] ^= blk[k];
             }
         }
 
-        // picking parity disk
         unsigned int parity_disk = (unsigned int)n - ((s % (unsigned int)n) + 1);
-        if (parity_disk >= (unsigned int)n)
+        if (parity_disk >= (unsigned int)n) {
             parity_disk = 0;
+        }
 
-        for (unsigned int d=0, dj=0; d < (unsigned int)n; d++) {
-            const void* blk_ptr;
+        pthread_t thread_ids[16];
+        unsigned int thread_count = 0;
+        unsigned int data_block_index = 0;
+
+        for (unsigned int d = 0; d < (unsigned int)n; d++) {
+            const unsigned char *src_block;
             if (d == parity_disk) {
-                blk_ptr = parity;
+                src_block = parity;
             } else {
-                blk_ptr = stripe + (dj++) * b; // mapping next data block
+                src_block = stripe + (data_block_index++) * b;
             }
 
-            // WRITE <dss> <file> <stripe> <disk> <type> <b>\n<raw bytes>
             char header[256];
             int hdrlen = snprintf(header, sizeof(header),
                                   "WRITE %s %s %u %u %s %u\n",
                                   dss, LAST_COPY_FILE, s, d,
-                                  (d == parity_disk) ? "PARITY": "DATA",
-                                  b
-            );
-
-            size_t pkt_len = (size_t)hdrlen + b;
-            unsigned char* pkt = (unsigned char*)malloc(pkt_len);
-            if (!pkt) {
-                LOG_ERROR("malloc failed for UDP packet");
+                                  (d == parity_disk) ? "PARITY" : "DATA",
+                                  b);
+            if (hdrlen < 0 || (size_t)hdrlen >= sizeof(header)) {
+                LOG_WARN("Failed to construct WRITE header");
+                fclose(fp);
+                free(parity);
+                free(stripe);
+                return -1;
             }
 
-            memcpy(pkt, header, hdrlen);
-            memcpy(pkt+hdrlen, blk_ptr, b);
-            ssize_t wr = sendto(p2p_sock, pkt, pkt_len, 0, (struct sockaddr*)&peers[d].addr, sizeof(peers[d].addr));
-            if (wr < 0) {
-                LOG_ERROR("sendto failed - copy - raw bytes");
+            BlockSendTask *task = (BlockSendTask *)malloc(sizeof(BlockSendTask));
+            if (!task) {
+                LOG_WARN("Failed to allocate block send task");
+                fclose(fp);
+                free(parity);
+                free(stripe);
+                return -1;
             }
-            free(pkt);
+
+            size_t packet_len = (size_t)hdrlen + b;
+            unsigned char *packet = (unsigned char *)malloc(packet_len);
+            if (!packet) {
+                LOG_WARN("Failed to allocate packet buffer");
+                free(task);
+                fclose(fp);
+                free(parity);
+                free(stripe);
+                return -1;
+            }
+
+            memcpy(packet, header, (size_t)hdrlen);
+            memcpy(packet + hdrlen, src_block, b);
+
+            task->dest = peers[d].addr;
+            task->packet = packet;
+            task->packet_len = packet_len;
+            if (pthread_create(&thread_ids[thread_count], NULL, send_block_thread, task) != 0) {
+                LOG_WARN("Failed to spawn writer thread");
+                free(packet);
+                free(task);
+                fclose(fp);
+                free(parity);
+                free(stripe);
+                return -1;
+            }
+            thread_count++;
+        }
+
+        for (unsigned int t = 0; t < thread_count; t++) {
+            pthread_join(thread_ids[t], NULL);
         }
     }
 
@@ -180,9 +263,14 @@ static void copy_params(char* resp, int sock)
     free(stripe);
     fclose(fp);
 
-    // done with phase-2 of copy. Send copy-complete
     const char *cc = "copy-complete";
-    sendto(sock, cc, strlen(cc), 0, (struct sockaddr*)&MANAGER_ADDR, sizeof(MANAGER_ADDR));
+    if (sendto(MANAGER_SOCK, cc, strlen(cc), 0,
+               (struct sockaddr *)&MANAGER_ADDR, sizeof(MANAGER_ADDR)) < 0) {
+        LOG_WARN("Failed to send copy-complete to manager");
+        return -1;
+    }
+
+    return 0;
 }
 
 int receive_cmd(char *cmd_buffer, char *local_ip)
@@ -221,19 +309,24 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
 	    strcpy(cmd_buffer, line);
     } else if (strncmp(line, "copy", 4) == 0) {
         char file_name[NAME_LEN];
-        int file_size = 0;
+        unsigned int file_size = 0;
         char owner[NAME_LEN];
-        if (snprintf(cmd_buffer, COMMAND_SIZE, "copy %s %d %s", file_name, file_size, owner) == 3) {
-            strcpy(LAST_COPY_FILE, file_name);
+        if (sscanf(line, "copy %15s %u %15s", file_name, &file_size, owner) == 3) {
+            snprintf(cmd_buffer, COMMAND_SIZE, "copy %s %u %s", file_name, file_size, owner);
+            strncpy(LAST_COPY_FILE, file_name, NAME_LEN - 1);
+            LAST_COPY_FILE[NAME_LEN - 1] = '\0';
             LAST_COPY_SIZE = file_size;
-            strcpy(LAST_COPY_OWNER, owner);
+            strncpy(LAST_COPY_OWNER, owner, NAME_LEN - 1);
+            LAST_COPY_OWNER[NAME_LEN - 1] = '\0';
         } else {
-            LOG_INFO("Unknown command format for copy");
+            LOG_WARN("Unknown command format for copy");
+            free(line);
+            return -1;
         }
     } else if (strncmp(line, "ls", 2) == 0) {
         strcpy(cmd_buffer, "ls");
     } else {
-        LOG_INFO("Unknown command: %s", line);
+        LOG_WARN("Unknown command: %s", line);
         free(line);
         return -1;
     }
@@ -269,19 +362,33 @@ int main(int argc, char* argv[])
     get_local_ip(local_ip, sizeof(local_ip));
     LOG_INFO("[user name]: %s [local IP]: %s", USERNAME, local_ip);
 
-    LOG_INFO("creating new socket");
-    int sock = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
+    LOG_INFO("creating manager socket");
+    MANAGER_SOCK = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (MANAGER_SOCK < 0) {
         LOG_ERROR("socket creation failed");
     }
-    LOG_INFO("socket created successfully.");
+    LOG_INFO("manager socket created successfully.");
 
-    struct sockaddr_in local = {0};
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = htonl(INADDR_ANY);
-    local.sin_port = htons(MPORT);
-    if (bind(sock, (struct sockaddr*)&local, sizeof(local)) < 0) {
+    struct sockaddr_in local_m = {0};
+    local_m.sin_family = AF_INET;
+    local_m.sin_addr.s_addr = htonl(INADDR_ANY);
+    local_m.sin_port = htons(MPORT);
+    if (bind(MANAGER_SOCK, (struct sockaddr*)&local_m, sizeof(local_m)) < 0) {
         LOG_ERROR("bind() with MPORT failed");
+    }
+
+    LOG_INFO("creating copy socket");
+    COPY_SOCK = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (COPY_SOCK < 0) {
+        LOG_ERROR("copy socket creation failed");
+    }
+
+    struct sockaddr_in local_c = {0};
+    local_c.sin_family = AF_INET;
+    local_c.sin_addr.s_addr = htonl(INADDR_ANY);
+    local_c.sin_port = htons(CPORT);
+    if (bind(COPY_SOCK, (struct sockaddr*)&local_c, sizeof(local_c)) < 0) {
+        LOG_ERROR("bind() with CPORT failed");
     }
     
     char cmd_buffer[COMMAND_SIZE];
@@ -296,7 +403,7 @@ int main(int argc, char* argv[])
         LOG_INFO("sending command \"%s\" to manager", cmd_buffer);
 
         // send command to manager
-        if ( sendto(sock, cmd_buffer, strlen(cmd_buffer), 0, (struct sockaddr*) &MANAGER_ADDR, sizeof(MANAGER_ADDR)) != (ssize_t) strlen(cmd_buffer) ) {
+        if ( sendto(MANAGER_SOCK, cmd_buffer, strlen(cmd_buffer), 0, (struct sockaddr*) &MANAGER_ADDR, sizeof(MANAGER_ADDR)) != (ssize_t) strlen(cmd_buffer) ) {
             LOG_ERROR("send FAILED. Different number of bytes sent.");
         }
 
@@ -305,13 +412,28 @@ int main(int argc, char* argv[])
         char response[RESPONSE_SIZE];
         ssize_t resp_len;
 
-        if ( (resp_len = recvfrom(sock, response, RESPONSE_SIZE-1, 0, (struct sockaddr*)&src_addr, &src_len)) < 0) {
+        if ( (resp_len = recvfrom(MANAGER_SOCK, response, RESPONSE_SIZE-1, 0, (struct sockaddr*)&src_addr, &src_len)) < 0) {
             LOG_ERROR("failed to receive response");
         }
         response[resp_len] = '\0';
 
         if (strncmp(response, "COPY-PARAMS ", 12) == 0) {
-            copy_params(response, sock);
+            if (copy_params(response) == 0) {
+                if ((resp_len = recvfrom(MANAGER_SOCK, response, RESPONSE_SIZE - 1, 0,
+                                         (struct sockaddr*)&src_addr, &src_len)) < 0) {
+                    LOG_ERROR("failed to receive post-copy response");
+                } else {
+                    response[resp_len] = '\0';
+                    if (MANAGER_ADDR.sin_addr.s_addr != src_addr.sin_addr.s_addr) {
+                        LOG_ERROR("Received response from unknown source. MITM possible. Halting");
+                    } else {
+                        printf("[response]: %s [src ip]: %s\n", response, inet_ntoa(src_addr.sin_addr));
+                    }
+                }
+            } else {
+                printf("[response]: FAILURE: Copy aborted locally [src ip]: %s\n",
+                       inet_ntoa(src_addr.sin_addr));
+            }
             continue;
         }
 
@@ -325,7 +447,12 @@ int main(int argc, char* argv[])
     }
 
     LOG_INFO("Closing socket");
-    close(sock);
+    if (MANAGER_SOCK >= 0) {
+        close(MANAGER_SOCK);
+    }
+    if (COPY_SOCK >= 0) {
+        close(COPY_SOCK);
+    }
     LOG_INFO("Exiting");
     exit(0);
 }
