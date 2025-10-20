@@ -66,6 +66,13 @@ typedef struct {
     int is_pending;
 } PendingCopy;
 
+typedef struct {
+    int active;
+    int dss_idx;
+    char file[NAME_LEN];
+    char user[NAME_LEN];
+    size_t size;
+} PendingRead;
 
 // command handler that will handle the incoming commands
 // return 0 is success else -1
@@ -84,5 +91,7 @@ int configure_dss(char*, int n, uint32_t stripping_unit);
 int ls(char* response_buffer, size_t buffer_size);
 
 int copy(char* file_name, int file_size, char* owner);
+
+int read_file(char* file_name, char* user_name);
 
 #endif // MANAGER_H

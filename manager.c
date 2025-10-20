@@ -17,6 +17,7 @@ static uint16_t MANAGER_PORT;
 static int g_rng_seeded = 0;
 
 static PendingCopy pending_copy = {0};
+static PendingRead pending_read = {0};
 
 static int is_power_of_two(uint32_t n)
 {
@@ -289,6 +290,58 @@ int copy(char* file_name, int file_size, char* owner) {
     return selected_dss_idx;
 }
 
+int read_file(char* file_name, char* user_name) {
+    if (dss_count == 0) {
+        LOG_WARN("No DSSs configured for read operation");
+        return -1;
+    }
+
+    for (int i = 0; i < dss_count; i++) {
+        DSS *dss = &dss_list[i];
+        for (int j = 0; j < dss->file_count; j++) {
+            if (strcmp(dss->files[j].name, file_name) == 0) {
+                pending_read.active = 1;
+                pending_read.dss_idx = i;
+                strncpy(pending_read.file, file_name, NAME_LEN - 1);
+                pending_read.file[NAME_LEN - 1] = '\0';
+                strncpy(pending_read.user, user_name, NAME_LEN - 1);
+                pending_read.user[NAME_LEN - 1] = '\0';
+                pending_read.size = dss->files[j].size;
+                
+                LOG_INFO("Phase 1: Found file %s in DSS %s (%zu bytes) for user %s", 
+                         file_name, dss->name, pending_read.size, user_name);
+                return i;
+            }
+        }
+    }
+    
+    LOG_WARN("File %s not found in any DSS", file_name);
+    return -2;
+}
+
+static int read_response(int dss_idx, char* out, size_t outlen)
+{
+    DSS* dss = &dss_list[dss_idx];
+    size_t off = 0;
+
+    int w = snprintf(out + off, outlen - off, "READ-PARAMS %s %d %u %zu",
+                     dss->name, dss->n, dss->striping_unit, pending_read.size);
+
+    if (w < 0 || (size_t)w >= outlen - off)
+        return -1;
+    off += w;
+
+    for (int i=0; i < dss->n; i++) {
+        int di = dss->disk_indices[i];
+        w = snprintf(out + off, outlen-off, " %s %s %hu",
+                 disks[di].name, disks[di].ipv4_addr, disks[di].cport);
+        if (w < 0 || (size_t)w >= outlen - off)
+            return -1;
+        off+=w;
+    }
+    return 0;
+}
+
 static int copy_response(int dss_idx, char* out, size_t outlen)
 {
     DSS* dss = &dss_list[dss_idx];
@@ -300,7 +353,6 @@ static int copy_response(int dss_idx, char* out, size_t outlen)
     // very rare case but still good to consider...
     if (w < 0 || (size_t)w >= outlen - off)
         return -1;
-
     off += w;
 
     for (int i=0; i < dss->n; i++) {
@@ -321,6 +373,12 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
     // check if copy operation is pending, if it is then copy-complete is only allowed
     if (pending_copy.is_pending && strncmp(cmd, "copy-complete", 13) != 0) {
         strcpy(response, "FAILURE: Copy operation in progress, only copy-complete allowed");
+        goto send_response;
+    }
+    
+    // check if read operation is pending, if it is then read-complete is only allowed
+    if (pending_read.active && strncmp(cmd, "read-complete", 13) != 0) {
+        strcpy(response, "FAILURE: Read operation in progress, only read-complete allowed");
         goto send_response;
     }
     
@@ -430,6 +488,34 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
             
             pending_copy.is_pending = 0;
             strcpy(response, "SUCCESS: copy-complete");
+        }
+    } else if (strncmp(cmd, "read ", 5) == 0) {
+        char file_name[NAME_LEN];
+        char user_name[NAME_LEN];
+        if (sscanf(cmd, "read %s %s", file_name, user_name) == 2) {
+            int resp_code = read_file(file_name, user_name);
+            if (resp_code >= 0) {
+                if (read_response(resp_code, response, sizeof(response)) != 0) {
+                    pending_read.active = 0;
+                    strcpy(response, "FAILURE: Response too large");
+                }
+            } else if (resp_code == -1) {
+                strcpy(response, "FAILURE: No DSSs configured");
+            } else if (resp_code == -2) {
+                strcpy(response, "FAILURE: File not found");
+            }
+        } else {
+            strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
+        }
+    } else if (strncmp(cmd, "read-complete", 13) == 0) {
+        if (!pending_read.active) {
+            strcpy(response, "FAILURE: No pending read operation");
+        } else {
+            LOG_INFO("Phase 2: File %s successfully read by user %s", 
+                     pending_read.file, pending_read.user);
+            
+            pending_read.active = 0;
+            strcpy(response, "SUCCESS: read-complete");
         }
     } else {
         LOG_WARN("Unknown command: %s", cmd);
