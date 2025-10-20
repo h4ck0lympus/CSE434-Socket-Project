@@ -568,7 +568,16 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
     } else if (strncmp(cmd, "ls", 2) == 0) {
         char temp[4096];
         if (ls(temp, sizeof(temp)) == 0) {
-            snprintf(response, sizeof(response), "SUCCESS\n%s", temp);
+            const char *prefix = "SUCCESS\n";
+            size_t prefix_len = strlen(prefix);
+            size_t temp_len = strnlen(temp, sizeof(temp));
+            size_t max_temp = sizeof(response) - prefix_len - 1;
+            if (temp_len > max_temp) {
+                temp_len = max_temp;
+            }
+            memcpy(response, prefix, prefix_len);
+            memcpy(response + prefix_len, temp, temp_len);
+            response[prefix_len + temp_len] = '\0';
         } else {
             strcpy(response, "FAILURE: No DSSs configured");
         }
@@ -597,11 +606,9 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         } else {
             DSS *dss = &dss_list[pending_copy.dss_idx];
             File *new_file = &dss->files[dss->file_count];
-            strncpy(new_file->name, pending_copy.file_name, NAME_LEN - 1);
-            new_file->name[NAME_LEN - 1] = '\0';
+            snprintf(new_file->name, NAME_LEN, "%s", pending_copy.file_name);
             new_file->size = pending_copy.file_size;
-            strncpy(new_file->owner, pending_copy.owner, NAME_LEN - 1);
-            new_file->owner[NAME_LEN - 1] = '\0';
+            snprintf(new_file->owner, NAME_LEN, "%s", pending_copy.owner);
             dss->file_count++;
             
             LOG_INFO("Phase 2: File %s successfully added to DSS %s", 
