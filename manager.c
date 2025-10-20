@@ -255,39 +255,23 @@ int ls(char* response_buffer, size_t buffer_size)
     return 0;
 }
 
-int copy(char* file_name, int file_size, char* owner, char* response_buffer, size_t buffer_size) {
+int copy(char* file_name, int file_size, char* owner) {
     if (dss_count == 0) {
         LOG_INFO("No DSSs configured for copy operation");
         return -1;
     }
 
-    // randomly select dss 
-    init_rng();
-    int selected_dss_idx = rand() % dss_count;
-    DSS *selected_dss = &dss_list[selected_dss_idx];
-    
-    if (selected_dss->file_count >= MAX_FILES) {
-        LOG_INFO("Selected DSS %s is full", selected_dss->name);
-        return -1;
+    int selected_dss_idx = -1;
+    for (int i=0; i < dss_count; i++) {
+        if (dss_list[i].file_count < MAX_FILES) {
+            selected_dss_idx = i;
+            break;
+        }
     }
 
-    // return : 
-    // the dss name
-    // n: number of disk in disk array
-    // dss striping_unit
-    int offset = 0;
-    offset += snprintf(response_buffer + offset, buffer_size - offset, \
-                      "%s %d %u", selected_dss->name, selected_dss->n, selected_dss->striping_unit);
-   
-    // also return the select dss's :
-    // disk/s name
-    // disk/s ipv4 address
-    // disk/s command port
-    for (int i = 0; i < selected_dss->n; i++) {
-        int disk_idx = selected_dss->disk_indices[i];
-        offset += snprintf(response_buffer + offset, buffer_size - offset, \
-                          " %s %s %hu", disks[disk_idx].name,  \
-                          disks[disk_idx].ipv4_addr, disks[disk_idx].cport);
+    if (selected_dss_idx < 0) {
+        LOG_INFO("No DSS is empty for the file");
+        return -2;
     }
 
     strncpy(pending_copy.file_name, file_name, NAME_LEN - 1);
@@ -298,11 +282,36 @@ int copy(char* file_name, int file_size, char* owner, char* response_buffer, siz
     pending_copy.dss_idx = selected_dss_idx;
     pending_copy.is_pending = 1;
 
+    DSS* selected_dss = &dss_list[selected_dss_idx];
     // phase-1 ended now phase 2 will occur from user's side
     LOG_INFO("Phase 1: Selected DSS %s for file %s (%d bytes) from owner %s", 
              selected_dss->name, file_name, file_size, owner);
-    
     return selected_dss_idx;
+}
+
+static int copy_response(int dss_idx, char* out, size_t outlen)
+{
+    DSS* dss = &dss_list[dss_idx];
+    size_t off = 0;
+
+    int w = snprintf(out + off, outlen - off, "COPY-PARAMS %s %d %u",
+                     dss->name, dss->n, dss->striping_unit);
+
+    // very rare case but still good to consider...
+    if (w < 0 || (size_t)w >= outlen - off)
+        return -1;
+
+    off += w;
+
+    for (int i=0; i < dss->n; i++) {
+        int di = dss->disk_indices[i];
+        w = snprintf(out + off, outlen-off, " %s %s %hu",
+                 disks[di].name, disks[di].ipv4_addr, disks[di].cport);
+        if (w < 0 || (size_t)w >= outlen - off)
+            return -1;
+        off+=w;
+    }
+    return 0;
 }
 
 int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client_len)
@@ -389,10 +398,16 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         int file_size;
         char owner[NAME_LEN];
         if (sscanf(cmd, "copy %s %d %s", file_name, &file_size, owner) == 3) {
-            if (copy(file_name, file_size, owner, response + 8, sizeof(response) - 8) >= 0) {
-                strcpy(response, "SUCCESS: copy phase-1 complete");
-            } else {
-                strcpy(response, "FAILURE: No DSSs configured or DSS full");
+            int resp_code = copy(file_name, file_size, owner);
+            if (resp_code >= 0) {
+                if (copy_response(resp_code, response, sizeof(response)) != 0) {
+                    pending_copy.is_pending = 0; // flip the switch
+                    strcpy(response, "FAILURE: Response too large");
+                }
+            } else if (resp_code == -1) {
+                strcpy(response, "FAILURE: No DSSs configured");
+            } else if (resp_code == -2) {
+                strcpy(response, "FAILURE: No DSSs empty.");
             }
         } else {
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");

@@ -83,6 +83,6 @@ int configure_dss(char*, int n, uint32_t stripping_unit);
 
 int ls(char* response_buffer, size_t buffer_size);
 
-int copy(char* file_name, int file_size, char* owner, char* response_buffer, size_t buffer_size);
+int copy(char* file_name, int file_size, char* owner);
 
 #endif // MANAGER_H
