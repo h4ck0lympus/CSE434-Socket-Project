@@ -263,44 +263,50 @@ static int copy_params(char *resp)
 static void *read_block_thread(void *arg)
 {
     BlockReadTask *task = (BlockReadTask *)arg;
-    if (!task) {
-        return NULL;
-    }
+    if (!task) return NULL;
 
     task->success = 0;
     *(task->block_data) = NULL;
     *(task->block_size) = 0;
 
-    ssize_t wr = sendto(COPY_SOCK, task->request, task->request_len, 0,
-                        (struct sockaddr *)&task->dest, sizeof(task->dest));
-    if (wr < 0) {
+    int s = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s < 0) { LOG_WARN("read socket creation failed"); return NULL; }
+
+    // short timeout so we don't hang forever
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+    // bind to ephemeral port (0) on INADDR_ANY
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons(0);
+    bind(s, (struct sockaddr*)&local, sizeof local);
+
+    // send request
+    if (sendto(s, task->request, task->request_len, 0,
+               (struct sockaddr *)&task->dest, sizeof(task->dest)) < 0) {
         LOG_WARN("sendto failed while requesting stripe block");
+        close(s);
         return NULL;
     }
 
+    // receive response
     const size_t buf_size = 2048 + 2 * 1024 * 1024;
     unsigned char *buffer = (unsigned char *)malloc(buf_size);
-    if (!buffer) {
-        LOG_WARN("Failed to allocate read buffer");
-        return NULL;
-    }
+    if (!buffer) { LOG_WARN("Failed to allocate read buffer"); close(s); return NULL; }
 
-    struct sockaddr_in src_addr;
-    socklen_t src_len = sizeof(src_addr);
-    ssize_t recv_len = recvfrom(COPY_SOCK, buffer, buf_size, 0,
+    struct sockaddr_in src_addr; socklen_t src_len = sizeof(src_addr);
+    ssize_t recv_len = recvfrom(s, buffer, buf_size, 0,
                                 (struct sockaddr *)&src_addr, &src_len);
     if (recv_len < 0) {
         LOG_WARN("recvfrom failed while reading stripe block");
-        free(buffer);
-        return NULL;
+        free(buffer); close(s); return NULL;
     }
 
+    // parse header + payload
     unsigned char *newline = memchr(buffer, '\n', (size_t)recv_len);
-    if (!newline) {
-        LOG_WARN("Malformed read response received");
-        free(buffer);
-        return NULL;
-    }
+    if (!newline) { LOG_WARN("Malformed read response received"); free(buffer); close(s); return NULL; }
 
     size_t header_len = (size_t)(newline - buffer);
     size_t payload_len = (size_t)recv_len - header_len - 1;
@@ -309,8 +315,7 @@ static void *read_block_thread(void *arg)
     char status[16];
     if (sscanf((char *)buffer, "READ-RESPONSE %15s", status) != 1) {
         LOG_WARN("Failed to parse READ response header");
-        free(buffer);
-        return NULL;
+        free(buffer); close(s); return NULL;
     }
 
     if (strcmp(status, "SUCCESS") == 0) {
@@ -325,6 +330,7 @@ static void *read_block_thread(void *arg)
     }
 
     free(buffer);
+    close(s);
     return NULL;
 }
 
@@ -514,33 +520,33 @@ static int read_params(char *resp)
         unsigned int parity_disk = (unsigned int)n - ((s % (unsigned int)n) + 1);
         if (parity_disk >= (unsigned int)n) parity_disk = 0;
 
-        // Reconstruct data blocks
+        // reconstruct data blocks
         unsigned int data_idx = 0;
         for (int d = 0; d < n; d++) {
-            if ((unsigned int)d != parity_disk) {
-                if (blocks[d]) {
-                    memcpy(stripe_data + data_idx * b, blocks[d], b);
-                } else {
-                    // Recover missing block using parity
-                    if (blocks[parity_disk]) {
-                        unsigned char *recovered = (unsigned char *)malloc(b);
-                        memcpy(recovered, blocks[parity_disk], b);
-                        
-                        for (int j = 0; j < n; j++) {
-                            if (j != d && (unsigned int)j != parity_disk && blocks[j]) {
-                                for (unsigned k = 0; k < b; k++) {
-                                    recovered[k] ^= blocks[j][k];
-                                }
+            if ((unsigned int) d == parity_disk) continue;
+
+            if (blocks[d]) {
+                memcpy(stripe_data + data_idx * b, blocks[d], b);
+            } else {
+                // recover missing block using parity
+                if (blocks[parity_disk]) {
+                    unsigned char *recovered = (unsigned char *)malloc(b);
+                    memcpy(recovered, blocks[parity_disk], b);
+                    
+                    for (int j = 0; j < n; j++) {
+                        if (j != d && (unsigned int)j != parity_disk && blocks[j]) {
+                            for (unsigned k = 0; k < b; k++) {
+                                recovered[k] ^= blocks[j][k];
                             }
                         }
-                        memcpy(stripe_data + data_idx * b, recovered, b);
-                        free(recovered);
-                    } else {
-                        memset(stripe_data + data_idx * b, 0, b);
                     }
+                    memcpy(stripe_data + data_idx * b, recovered, b);
+                    free(recovered);
+                } else {
+                    memset(stripe_data + data_idx * b, 0, b);
                 }
-                data_idx++;
             }
+            data_idx++;
         }
 
         // Write stripe to file
