@@ -150,20 +150,93 @@ static void *copy_listener(void *arg)
         char block_type[8];
         unsigned int block_size = 0;
 
-        if (sscanf((char *)buffer, "WRITE %15s %15s %u %u %7s %u",
-                   dss, file_name, &stripe, &disk_idx, block_type, &block_size) != 6) {
-            LOG_INFO("Failed to parse WRITE header: %s", buffer);
-            continue;
-        }
+        // cHeck if this is a WRITE command
+        if (strncmp((char *)buffer, "WRITE ", 6) == 0) {
+            char dss[NAME_LEN];
+            char file_name[NAME_LEN];
+            unsigned int stripe = 0;
+            unsigned int disk_idx = 0;
+            char block_type[8];
+            unsigned int block_size = 0;
 
-        if (payload_len != block_size) {
-            LOG_INFO("WRITE payload length mismatch: expected %u, got %zu",
-                     block_size, payload_len);
-            continue;
-        }
+            if (sscanf((char *)buffer, "WRITE %15s %15s %u %u %7s %u",
+                       dss, file_name, &stripe, &disk_idx, block_type, &block_size) != 6) {
+                LOG_INFO("Failed to parse WRITE header: %s", buffer);
+                continue;
+            }
 
-        const unsigned char *payload = newline + 1;
-        persist_block(dss, file_name, stripe, disk_idx, block_type, payload, payload_len);
+            if (payload_len != block_size) {
+                LOG_INFO("WRITE payload length mismatch: expected %u, got %zu",
+                         block_size, payload_len);
+                continue;
+            }
+
+            const unsigned char *payload = newline + 1;
+            persist_block(dss, file_name, stripe, disk_idx, block_type, payload, payload_len);
+        }
+        // check if this is a READ command
+        else if (strncmp((char *)buffer, "READ ", 5) == 0) {
+            char dss[NAME_LEN];
+            char file_name[NAME_LEN];
+            unsigned int stripe = 0;
+            unsigned int disk_idx = 0;
+
+            if (sscanf((char *)buffer, "READ %15s %15s %u %u",
+                       dss, file_name, &stripe, &disk_idx) != 4) {
+                LOG_INFO("Failed to parse READ header: %s", buffer);
+                continue;
+            }
+
+            // construct file path for the requested block
+            char file_path[512];
+            // DATA block
+            snprintf(file_path, sizeof(file_path), "storage/%s/%s/%s_stripe%u_disk%u_DATA.bin",
+                     DISK_NAME, dss, file_name, stripe, disk_idx);
+            
+            FILE *fp = fopen(file_path, "rb");
+            if (!fp) {
+                // PARITY block
+                snprintf(file_path, sizeof(file_path), "storage/%s/%s/%s_stripe%u_disk%u_PARITY.bin",
+                         DISK_NAME, dss, file_name, stripe, disk_idx);
+                fp = fopen(file_path, "rb");
+            }
+
+            char response_header[256];
+            if (fp) {
+                // get file size
+                fseek(fp, 0, SEEK_END);
+                long file_size = ftell(fp);
+                fseek(fp, 0, SEEK_SET);
+
+                if (file_size > 0) {
+                    unsigned char *block_data = (unsigned char *)malloc(file_size);
+                    if (block_data && fread(block_data, 1, file_size, fp) == (size_t)file_size) {
+                        int header_len = snprintf(response_header, sizeof(response_header),
+                                                  "READ-RESPONSE SUCCESS\n");
+                        
+                        size_t total_size = header_len + file_size;
+                        unsigned char *response = (unsigned char *)malloc(total_size);
+                        if (response) {
+                            memcpy(response, response_header, header_len);
+                            memcpy(response + header_len, block_data, file_size);
+                            
+                            sendto(COPY_SOCK, response, total_size, 0,
+                                   (struct sockaddr *)&src_addr, src_len);
+                            free(response);
+                        }
+                    }
+                    free(block_data);
+                }
+                fclose(fp);
+            } else {
+                snprintf(response_header, sizeof(response_header), "READ-RESPONSE FAILURE\n");
+                sendto(COPY_SOCK, response_header, strlen(response_header), 0,
+                       (struct sockaddr *)&src_addr, src_len);
+            }
+        }
+        else {
+            LOG_INFO("Unknown command received: %s", buffer);
+        }
     }
 
     free(buffer);
