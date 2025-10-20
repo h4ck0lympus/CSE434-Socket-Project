@@ -22,9 +22,9 @@
 #define COMMAND_SIZE 1024
 #define RESPONSE_SIZE 1024
 
-#define USERNAME_LEN 16
+#define NAME_LEN 256
+#define USERNAME_LEN 256
 #define MAX_DISKS 100
-#define NAME_LEN 16
 
 typedef struct {
     char name[NAME_LEN];

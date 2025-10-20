@@ -19,7 +19,7 @@
 #define COMMAND_SIZE 1024
 #define MAX_PEERS 100
 #define MAX_DSS 10
-#define NAME_LEN 16
+#define NAME_LEN 256
 #define MAX_FILES 1000
 
 typedef struct {

@@ -73,7 +73,7 @@ static int copy_params(char *resp)
     char dss[NAME_LEN];
     int n;
     unsigned b;
-    if (sscanf(resp, "COPY-PARAMS %15s %d %u", dss, &n, &b) != 3) {
+    if (sscanf(resp, "COPY-PARAMS %255s %d %u", dss, &n, &b) != 3) {
         LOG_WARN("FAILED: COPY-PARAMS arguments not correct. response: %s", resp);
         return -1;
     }
@@ -336,7 +336,7 @@ static int read_params(char *resp)
     int n;
     unsigned b;
     size_t file_size;
-    if (sscanf(resp, "READ-PARAMS %15s %d %u %zu", dss, &n, &b, &file_size) != 4) {
+    if (sscanf(resp, "READ-PARAMS %255s %d %u %zu", dss, &n, &b, &file_size) != 4) {
         LOG_WARN("FAILED: READ-PARAMS arguments not correct. response: %s", resp);
         return -1;
     }
@@ -581,7 +581,7 @@ static int failure_params(char *resp)
     char dss[NAME_LEN];
     int n;
     unsigned b;
-    if (sscanf(resp, "FAILURE-PARAMS %15s %d %u", dss, &n, &b) != 3) {
+    if (sscanf(resp, "FAILURE-PARAMS %255s %d %u", dss, &n, &b) != 3) {
         LOG_WARN("FAILED: FAILURE-PARAMS arguments not correct. response: %s", resp);
         return -1;
     }
@@ -716,7 +716,7 @@ static int failure_params(char *resp)
     while ((token = strtok(NULL, " \n")) != NULL) {
         char file_name[NAME_LEN];
         int num_stripes;
-        if (sscanf(token, "%15s_%d", file_name, &num_stripes) != 2) {
+        if (sscanf(token, "%255s_%d", file_name, &num_stripes) != 2) {
             continue; // Skip invalid entries
         }
         
@@ -841,7 +841,7 @@ static int decommission_params(char *resp)
     char dss[NAME_LEN];
     int n;
     unsigned b;
-    if (sscanf(resp, "DECOMMISSION-PARAMS %15s %d %u", dss, &n, &b) != 3) {
+    if (sscanf(resp, "DECOMMISSION-PARAMS %255s %d %u", dss, &n, &b) != 3) {
         LOG_WARN("FAILED: DECOMMISSION-PARAMS arguments not correct. response: %s", resp);
         return -1;
     }
@@ -992,7 +992,7 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
         char file_name[NAME_LEN];
         unsigned int file_size = 0;
         char owner[NAME_LEN];
-        if (sscanf(line, "copy %15s %u %15s", file_name, &file_size, owner) == 3) {
+        if (sscanf(line, "copy %255s %u %255s", file_name, &file_size, owner) == 3) {
             snprintf(cmd_buffer, COMMAND_SIZE, "copy %s %u %s", file_name, file_size, owner);
             strncpy(LAST_COPY_FILE, file_name, NAME_LEN - 1);
             LAST_COPY_FILE[NAME_LEN - 1] = '\0';
