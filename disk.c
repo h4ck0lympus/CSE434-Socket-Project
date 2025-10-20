@@ -479,21 +479,7 @@ int main(int argc, char* argv[])
         close(MANAGER_SOCK);
     }
     COPY_THREAD_ACTIVE = 0;
-    if (COPY_SOCK >= 0) {
-        if (COPY_THREAD_STARTED) {
-            int poke_sock = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
-            if (poke_sock >= 0) {
-                struct sockaddr_in poke = {0};
-                poke.sin_family = AF_INET;
-                poke.sin_port = htons(CPORT);
-                poke.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-                sendto(poke_sock, "STOP", 4, 0, (struct sockaddr*)&poke, sizeof(poke));
-                close(poke_sock);
-            }
-            pthread_join(COPY_THREAD, NULL);
-        }
-        close(COPY_SOCK);
-    }
+    close(COPY_SOCK);
     LOG_INFO("Exiting");
     exit(0);
 }
