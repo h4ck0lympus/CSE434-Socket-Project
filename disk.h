@@ -19,9 +19,9 @@
 #define COMMAND_SIZE 1024
 #define RESPONSE_SIZE 1024
 
-#define DISK_NAME_LEN 16
+#define DISK_NAME_LEN 256
 #ifndef NAME_LEN
-#define NAME_LEN 16
+#define NAME_LEN 256
 #endif
 
 #include <pthread.h>

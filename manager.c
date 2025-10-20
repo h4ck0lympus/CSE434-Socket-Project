@@ -619,7 +619,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         }
     } else if (strncmp(cmd, "read ", 5) == 0) {
         char dss_name[NAME_LEN], file_name[NAME_LEN], user_name[NAME_LEN];
-        if (sscanf(cmd, "read %15s %15s %15s", dss_name, file_name, user_name) == 3) {
+        if (sscanf(cmd, "read %255s %255s %255s", dss_name, file_name, user_name) == 3) {
             // find dss
             int dss_idx = -1;
             for (int i = 0; i < dss_count; i++) {

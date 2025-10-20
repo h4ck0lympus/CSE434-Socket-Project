@@ -152,7 +152,7 @@ static void *copy_listener(void *arg)
             char block_type[8];
             unsigned int block_size = 0;
 
-            if (sscanf((char *)buffer, "WRITE %15s %15s %u %u %7s %u",
+            if (sscanf((char *)buffer, "WRITE %255s %255s %u %u %7s %u",
                        dss, file_name, &stripe, &disk_idx, block_type, &block_size) != 6) {
                 LOG_INFO("Failed to parse WRITE header: %s", buffer);
                 continue;
@@ -174,7 +174,7 @@ static void *copy_listener(void *arg)
             unsigned int stripe = 0;
             unsigned int disk_idx = 0;
 
-            if (sscanf((char *)buffer, "READ %15s %15s %u %u",
+            if (sscanf((char *)buffer, "READ %255s %255s %u %u",
                        dss, file_name, &stripe, &disk_idx) != 4) {
                 LOG_INFO("Failed to parse READ header: %s", buffer);
                 continue;
@@ -230,7 +230,7 @@ static void *copy_listener(void *arg)
         // check if this is a FAIL command
         else if (strncmp((char *)buffer, "FAIL ", 5) == 0) {
             char dss_name[NAME_LEN];
-            if (sscanf((char *)buffer, "FAIL %15s", dss_name) != 1) {
+            if (sscanf((char *)buffer, "FAIL %255s", dss_name) != 1) {
                 LOG_INFO("Failed to parse FAIL header: %s", buffer);
                 continue;
             }
@@ -261,7 +261,7 @@ static void *copy_listener(void *arg)
         // check if this is a LIST command (for recovery)
         else if (strncmp((char *)buffer, "LIST ", 5) == 0) {
             char dss_name[NAME_LEN];
-            if (sscanf((char *)buffer, "LIST %15s", dss_name) != 1) {
+            if (sscanf((char *)buffer, "LIST %255s", dss_name) != 1) {
                 LOG_INFO("Failed to parse LIST header: %s", buffer);
                 continue;
             }

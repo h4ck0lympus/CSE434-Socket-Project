@@ -102,7 +102,7 @@ static int copy_params(char *resp)
     }
 
     for (int i = 0; i < n; i++) {
-        if (sscanf(cursor, "%15s %15s %hu",
+        if (sscanf(cursor, "%255s %255s %hu",
                    peers[i].name, peers[i].ip, &peers[i].cport) != 3) {
             LOG_WARN("peer info incorrect format @ %d", i);
             return -1;
@@ -309,7 +309,7 @@ static void *read_block_thread(void *arg)
     buffer[header_len] = '\0';
 
     char status[16];
-    if (sscanf((char *)buffer, "READ-RESPONSE %15s", status) != 1) {
+    if (sscanf((char *)buffer, "READ-RESPONSE %255s", status) != 1) {
         LOG_WARN("Failed to parse READ response header");
         free(buffer); close(s); return NULL;
     }
@@ -366,7 +366,7 @@ static int read_params(char *resp)
     }
 
     for (int i = 0; i < n; i++) {
-        if (sscanf(cursor, "%15s %15s %hu",
+        if (sscanf(cursor, "%255s %255s %hu",
                    peers[i].name, peers[i].ip, &peers[i].cport) != 3) {
             LOG_WARN("peer info incorrect format @ %d", i);
             return -1;
@@ -611,7 +611,7 @@ static int failure_params(char *resp)
     }
 
     for (int i = 0; i < n; i++) {
-        if (sscanf(cursor, "%15s %15s %hu",
+        if (sscanf(cursor, "%255s %255s %hu",
                    peers[i].name, peers[i].ip, &peers[i].cport) != 3) {
             LOG_WARN("peer info incorrect format @ %d", i);
             return -1;
@@ -859,7 +859,7 @@ static int decommission_params(char *resp)
         skip++;
     }
     for (int i = 0; i < n; i++) {
-        if (sscanf(cursor, "%15s %15s %hu",
+        if (sscanf(cursor, "%255s %255s %hu",
                    peers[i].name, peers[i].ip, &peers[i].cport) != 3) {
             LOG_WARN("peer info incorrect format @ %d", i);
             return -1;
@@ -1008,7 +1008,7 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
         char dss_name[NAME_LEN];
         char file_name[NAME_LEN];
         char user_name[NAME_LEN];
-        if (sscanf(line, "read %15s %15s %15s", dss_name, file_name, user_name) == 3) {
+        if (sscanf(line, "read %255s %255s %255s", dss_name, file_name, user_name) == 3) {
             snprintf(cmd_buffer, COMMAND_SIZE, "read %s %s %s", dss_name, file_name, user_name);
             strncpy(LAST_COPY_FILE, file_name, NAME_LEN - 1);
             LAST_COPY_FILE[NAME_LEN - 1] = '\0';
@@ -1019,7 +1019,7 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
         }
     } else if (strncmp(line, "disk-failure", 12) == 0) {
         char dss_name[NAME_LEN];
-        if (sscanf(line, "disk-failure %15s", dss_name) == 1) {
+        if (sscanf(line, "disk-failure %255s", dss_name) == 1) {
             snprintf(cmd_buffer, COMMAND_SIZE, "disk-failure %s", dss_name);
         } else {
             LOG_WARN("Unknown command format for disk-failure");
@@ -1028,7 +1028,7 @@ int receive_cmd(char *cmd_buffer, char *local_ip)
         }
     } else if (strncmp(line, "decommission-dss", 16) == 0) {
         char dss_name[NAME_LEN];
-        if (sscanf(line, "decommission-dss %15s", dss_name) == 1) {
+        if (sscanf(line, "decommission-dss %255s", dss_name) == 1) {
             snprintf(cmd_buffer, COMMAND_SIZE, "decommission-dss %s", dss_name);
         } else {
             LOG_WARN("Unknown command format for decommission-dss");
