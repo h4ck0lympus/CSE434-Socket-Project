@@ -52,12 +52,6 @@ int get_local_ip(char *buffer, size_t buflen) {
     return found ? 0 : -1;
 }
 
-typedef struct {
-    struct sockaddr_in dest;
-    unsigned char *packet;
-    size_t packet_len;
-} BlockSendTask;
-
 static void *send_block_thread(void *arg)
 {
     BlockSendTask *task = (BlockSendTask *)arg;
@@ -97,13 +91,6 @@ static int copy_params(char *resp)
         LOG_WARN("Copy socket not initialized");
         return -1;
     }
-
-    typedef struct {
-        char name[NAME_LEN];
-        char ip[16];
-        uint16_t cport;
-        struct sockaddr_in addr;
-    } Peer;
 
     Peer peers[16];
     if (n > (int)(sizeof(peers) / sizeof(peers[0]))) {
@@ -362,13 +349,6 @@ static int read_params(char *resp)
         return -1;
     }
 
-    typedef struct {
-        char name[NAME_LEN];
-        char ip[16];
-        uint16_t cport;
-        struct sockaddr_in addr;
-    } Peer;
-
     Peer peers[16];
     if (n > (int)(sizeof(peers) / sizeof(peers[0]))) {
         LOG_WARN("n is too big");
@@ -613,13 +593,6 @@ static int failure_params(char *resp)
         LOG_WARN("Copy socket not initialized");
         return -1;
     }
-
-    typedef struct {
-        char name[NAME_LEN];
-        char ip[16];
-        uint16_t cport;
-        struct sockaddr_in addr;
-    } Peer;
 
     Peer peers[16];
     if (n > (int)(sizeof(peers) / sizeof(peers[0]))) {
@@ -880,13 +853,6 @@ static int decommission_params(char *resp)
         LOG_WARN("Copy socket not initialized");
         return -1;
     }
-
-    typedef struct {
-        char name[NAME_LEN];
-        char ip[16];
-        uint16_t cport;
-        struct sockaddr_in addr;
-    } Peer;
 
     Peer peers[16];
     if (n > (int)(sizeof(peers) / sizeof(peers[0]))) {

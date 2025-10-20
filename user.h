@@ -46,6 +46,19 @@ typedef struct {
 } BlockReadTask;
 
 typedef struct {
+    struct sockaddr_in dest;
+    unsigned char *packet;
+    size_t packet_len;
+} BlockSendTask;
+
+typedef struct {
+    char name[NAME_LEN];
+    char ip[16];
+    uint16_t cport;
+    struct sockaddr_in addr;
+} Peer;
+
+typedef struct {
     int disk_idx;
     char *block_data;
     size_t block_size;
