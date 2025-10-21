@@ -15,6 +15,8 @@ static int SOCK;
 struct sockaddr_in MANAGER_ADDR;
 static uint16_t MANAGER_PORT;
 static int g_rng_seeded = 0;
+static struct sockaddr_in last_cfg_sender;
+static int last_cfg_sender_set = 0;
 
 static PendingCopy pending_copy = {0};
 static PendingRead pending_read = {0};
@@ -77,6 +79,7 @@ int register_user(char* name, char* ip, uint16_t mport, uint16_t cport)
     strncpy(users[user_count].ipv4_addr, ip, 15);
     users[user_count].mport = mport;
     users[user_count].cport = cport;
+    users[user_count].active_dss[0] = 0;
     user_count++;
 
     LOG_INFO("Registered user: %s at %s:%hu", name, ip, mport);
@@ -118,8 +121,63 @@ int register_disk(char* name, char* ip, uint16_t mport, uint16_t cport)
     return 0;
 }
 
+static int user_index_from_src(const struct sockaddr_in *src)
+{
+    char ipbuf[16];
+    strncpy(ipbuf, inet_ntoa(src->sin_addr), sizeof(ipbuf) - 1);
+    ipbuf[sizeof(ipbuf) - 1] = '\0';
+    uint16_t sport = ntohs(src->sin_port);
+
+    for (int i = 0; i < user_count; i++) {
+        if (users[i].mport == sport && strcmp(users[i].ipv4_addr, ipbuf) == 0) {
+            return i;
+        }
+    }
+    // only ports are matching
+    for (int i = 0; i < user_count; i++) {
+        if (users[i].mport == sport) return i;
+    }
+    return -1;
+}
+
+static int allot_dss_to_user(struct sockaddr_in *src, char *dss_name)
+{
+    char ipbuf[16];
+    strncpy(ipbuf, inet_ntoa(src->sin_addr), sizeof(ipbuf) - 1);
+    ipbuf[sizeof(ipbuf) - 1] = '\0';
+    uint16_t sport = ntohs(src->sin_port);
+
+    int idx = -1;
+    for (int i = 0; i < user_count; i++) {
+        if (users[i].mport == sport && strcmp(users[i].ipv4_addr, ipbuf) == 0) {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx < 0) {
+        for (int i = 0; i < user_count; i++) {
+            if (users[i].mport == sport) {
+                idx = i;
+                break;
+            }
+        }
+    }
+
+    if (idx < 0) {
+        LOG_WARN("allot_dss_to_user: no user found for %s:%hu", ipbuf, sport);
+        return -1;
+    }
+
+    strncpy(users[idx].active_dss, dss_name, sizeof(users[idx].active_dss) - 1);
+    users[idx].active_dss[sizeof(users[idx].active_dss) - 1] = '\0';
+
+    LOG_INFO("Allotted DSS %s to user %s (%s:%hu)",
+             users[idx].active_dss, users[idx].name, ipbuf, sport);
+    return 0;
+}
+
 int configure_dss(char *dss_name, int n, uint32_t striping_unit) {
-    // basic checks
     if (n < 3) {
         LOG_WARN("DSS configuration failed: n must be >= 3");
         return -1;
@@ -165,11 +223,11 @@ int configure_dss(char *dss_name, int n, uint32_t striping_unit) {
     dss_list[dss_count].file_count = 0;
 
     for (int k = 0; k < n; k++) {
-        int di = free_idx[k];
-        disks[di].state = IN_DSS;
-        strncpy(disks[di].dss_name, dss_name, NAME_LEN - 1);
-        disks[di].dss_name[NAME_LEN - 1] = '\0';
-        dss_list[dss_count].disk_indices[k] = di;
+        int fi = free_idx[k];
+        disks[fi].state = IN_DSS;
+        strncpy(disks[fi].dss_name, dss_name, NAME_LEN - 1);
+        disks[fi].dss_name[NAME_LEN - 1] = '\0';
+        dss_list[dss_count].disk_indices[k] = fi;
     }
 
     LOG_INFO("Configured DSS %s with n=%d, striping_unit=%u",
@@ -536,6 +594,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         if (sscanf(cmd, "configure-dss %s %d %u", 
                   dss_name, &n, &striping_unit) == 3) {
             if (configure_dss(dss_name, n, striping_unit) == 0) {
+                allot_dss_to_user(client_addr, dss_name);
                 strcpy(response, "SUCCESS: Dss configured");
             } else {
                 strcpy(response, "FAILURE: Unable to configure dss");
@@ -585,20 +644,46 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         char file_name[NAME_LEN];
         int file_size;
         char owner[NAME_LEN];
-        if (sscanf(cmd, "copy %s %d %s", file_name, &file_size, owner) == 3) {
-            int resp_code = copy(file_name, file_size, owner);
-            if (resp_code >= 0) {
-                if (copy_response(resp_code, response, sizeof(response)) != 0) {
-                    pending_copy.is_pending = 0; // flip the switch
-                    strcpy(response, "FAILURE: Response too large");
-                }
-            } else if (resp_code == -1) {
-                strcpy(response, "FAILURE: No DSSs configured");
-            } else if (resp_code == -2) {
-                strcpy(response, "FAILURE: No DSSs empty.");
-            }
-        } else {
+        if (sscanf(cmd, "copy %s %d %s", file_name, &file_size, owner) != 3) {
             strcpy(response, "FAILURE: failed to read arguments. Incorrect command format");
+            goto send_response;
+        }
+
+        int ui = user_index_from_src(client_addr);
+
+        // must have an active DSS
+        if (users[ui].active_dss[0] == '\0') {
+            strcpy(response, "FAILURE: User has no configured DSS");
+            goto send_response;
+        }
+
+        int dss_idx = -1;
+        for (int i = 0; i < dss_count; i++) {
+            if (strcmp(dss_list[i].name, users[ui].active_dss) == 0) {
+                dss_idx = i;
+                break;
+            }
+        }
+
+        if (dss_idx < 0) {
+            strcpy(response, "FAILURE: User's configured DSS not found");
+            goto send_response;
+        }
+
+        strncpy(pending_copy.file_name, file_name, NAME_LEN - 1);
+        pending_copy.file_name[NAME_LEN - 1] = '\0';
+        pending_copy.file_size = file_size;
+        strncpy(pending_copy.owner, owner, NAME_LEN - 1);
+        pending_copy.owner[NAME_LEN - 1] = '\0';
+        pending_copy.dss_idx = dss_idx;
+        pending_copy.is_pending = 1;
+
+        LOG_INFO("Phase 1: Selected DSS %s for file %s from owner %s",
+                  dss_list[dss_idx].name, file_name, owner);
+
+        if (copy_response(dss_idx, response, sizeof(response)) != 0) {
+            pending_copy.is_pending = 0;
+            strcpy(response, "FAILURE: Response too large");
         }
     } else if (strncmp(cmd, "copy-complete", 13) == 0) {
         if (!pending_copy.is_pending) {

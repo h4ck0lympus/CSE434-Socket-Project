@@ -27,6 +27,8 @@ typedef struct {
     char ipv4_addr[16];
     uint16_t mport;
     uint16_t cport;
+    char active_dss[NAME_LEN];
+    struct sockaddr_in maddr;
 } User;
 
 typedef enum {
