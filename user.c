@@ -168,6 +168,7 @@ static int copy_params(char *resp)
             }
         }
 
+        // parity disk rotates so one disk doesnt get hammered
         unsigned int parity_disk = (unsigned int)n - ((s % (unsigned int)n) + 1);
         if (parity_disk >= (unsigned int)n) {
             parity_disk = 0;
@@ -237,6 +238,7 @@ static int copy_params(char *resp)
             thread_count++;
         }
 
+        // wait for all threads or stripe gets corrupted
         for (unsigned int t = 0; t < thread_count; t++) {
             pthread_join(thread_ids[t], NULL);
         }
@@ -265,10 +267,11 @@ static void *read_block_thread(void *arg)
     *(task->block_data) = NULL;
     *(task->block_size) = 0;
 
+    // each thread needs it's own socket or recv() will get messed up
     int s = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s < 0) { LOG_WARN("read socket creation failed"); return NULL; }
 
-    // short timeout so we don't hang forever
+    // dont wait forever if disk is dead
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
@@ -513,6 +516,7 @@ static int read_params(char *resp)
             return -1;
         }
 
+        // parity disk rotates so one disk doesnt get hammered
         unsigned int parity_disk = (unsigned int)n - ((s % (unsigned int)n) + 1);
         if (parity_disk >= (unsigned int)n) parity_disk = 0;
 
@@ -546,6 +550,7 @@ static int read_params(char *resp)
         }
 
         // Write stripe to file
+        // last chunk might be smaller than full stripe
         size_t write_size = stripe_bytes;
         if (s == stripes - 1) {
             size_t remaining = file_size - s * stripe_bytes;
@@ -632,7 +637,7 @@ static int failure_params(char *resp)
         peers[i].addr.sin_port = htons(peers[i].cport);
     }
 
-    // Initialize random number generator if not already done
+    // mix in pid so multiple processes dont pick same disk
     static int rng_initialized = 0;
     if (!rng_initialized) {
         srand((unsigned)time(NULL) ^ (unsigned)getpid());
@@ -775,7 +780,7 @@ static int failure_params(char *resp)
                 free(tasks[t]);
             }
             
-            // XOR all working blocks to recover failed block
+            // xor magic to get missing block back
             unsigned char *recovered_block = (unsigned char *)malloc(b);
             if (!recovered_block) {
                 for (int d = 0; d < n; d++) free(blocks[d]);
@@ -792,6 +797,7 @@ static int failure_params(char *resp)
             }
             
             // Determine if recovered block is DATA or PARITY
+            // same parity calc as when we wrote it
             unsigned int parity_disk = (unsigned int)n - ((stripe % (unsigned int)n) + 1);
             if (parity_disk >= (unsigned int)n) parity_disk = 0;
             
@@ -891,6 +897,7 @@ static int decommission_params(char *resp)
         }
     }
 
+    // dont hang waiting for responses that aint coming
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(COPY_SOCK, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
@@ -899,6 +906,7 @@ static int decommission_params(char *resp)
     int timeouts = 0;
     const int MAX_TIMEOUTS = 8 * n;
 
+    // give up after too many timeouts or we'll wait forever
     while (completed < n && timeouts < MAX_TIMEOUTS) {
         char buffer[1024];
         struct sockaddr_in src; socklen_t srclen = sizeof(src);

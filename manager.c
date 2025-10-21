@@ -25,6 +25,7 @@ static PendingDecommission pending_decommission = {0};
 
 static int is_power_of_two(uint32_t n)
 {
+    // bit trick to check if power of 2
     return n && !(n & (n - 1));
 }
 
@@ -128,12 +129,13 @@ static int user_index_from_src(const struct sockaddr_in *src)
     ipbuf[sizeof(ipbuf) - 1] = '\0';
     uint16_t sport = ntohs(src->sin_port);
 
+    // try to match both ip and port first
     for (int i = 0; i < user_count; i++) {
         if (users[i].mport == sport && strcmp(users[i].ipv4_addr, ipbuf) == 0) {
             return i;
         }
     }
-    // only ports are matching
+    // fallback - just match port (for local testing)
     for (int i = 0; i < user_count; i++) {
         if (users[i].mport == sport) return i;
     }
@@ -209,6 +211,7 @@ int configure_dss(char *dss_name, int n, uint32_t striping_unit) {
         return -1;
     }
 
+    // shuffle the free disks so we dont always pick the same ones
     for (int i = free_count - 1; i > 0; i--) {
         int j = rand() % (i + 1);
         int t = free_idx[i];
@@ -232,6 +235,7 @@ int configure_dss(char *dss_name, int n, uint32_t striping_unit) {
 
     LOG_INFO("Configured DSS %s with n=%d, striping_unit=%u",
              dss_name, n, striping_unit);
+    // show which disks we picked
     printf("Assigned disks: ");
     for (int i = 0; i < n; i++) {
         printf("%s ", disks[dss_list[dss_count].disk_indices[i]].name);
@@ -323,6 +327,7 @@ int copy(char* file_name, int file_size, char* owner) {
     }
 
     int selected_dss_idx = -1;
+    // find first dss with room for more files
     for (int i=0; i < dss_count; i++) {
         if (dss_list[i].file_count < MAX_FILES) {
             selected_dss_idx = i;
@@ -356,6 +361,7 @@ int read_file(char* file_name, char* user_name) {
         return -1;
     }
 
+    // search all dss for the file
     for (int i = 0; i < dss_count; i++) {
         DSS *dss = &dss_list[i];
         for (int j = 0; j < dss->file_count; j++) {
@@ -517,7 +523,7 @@ static int copy_response(int dss_idx, char* out, size_t outlen)
     int w = snprintf(out + off, outlen - off, "COPY-PARAMS %s %d %u",
                      dss->name, dss->n, dss->striping_unit);
 
-    // very rare case but still good to consider...
+    // buffer overflow check - shouldnt happen but ya never know
     if (w < 0 || (size_t)w >= outlen - off)
         return -1;
     off += w;
@@ -537,7 +543,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
 {
     char response[4096];
     
-    // check if copy operation is pending, if it is then copy-complete is only allowed
+    // dont let other commands mess with copy in progress
     if (pending_copy.is_pending && strncmp(cmd, "copy-complete", 13) != 0) {
         strcpy(response, "FAILURE: Copy operation in progress, only copy-complete allowed");
         goto send_response;
@@ -555,7 +561,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         goto send_response;
     }
     
-    // check if decommission operation is pending, block ALL commands except decommission-complete
+    // decommission blocks everything - too dangerous otherwise
     if (pending_decommission.is_pending && strncmp(cmd, "decommission-complete", 21) != 0) {
         strcpy(response, "FAILURE: Decommission operation in progress (critical section)");
         goto send_response;
@@ -564,6 +570,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
     if (strncmp(cmd, "register-user", 13) == 0) {
         char name[NAME_LEN], ip[16];
         uint16_t mport, cport;
+        // parse the register command
         if (sscanf(cmd, "register-user %s %s %hu %hu", \
                    name, ip, &mport, &cport) == 4) {
             if (register_user(name, ip, mport, cport) == 0) {
@@ -591,6 +598,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         char dss_name[NAME_LEN];
         int n;
         uint32_t striping_unit;
+        // get dss config params
         if (sscanf(cmd, "configure-dss %s %d %u", 
                   dss_name, &n, &striping_unit) == 3) {
             if (configure_dss(dss_name, n, striping_unit) == 0) {
@@ -626,6 +634,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
         }
     } else if (strncmp(cmd, "ls", 2) == 0) {
         char temp[4096];
+        // build response with all the dss info
         if (ls(temp, sizeof(temp)) == 0) {
             const char *prefix = "SUCCESS\n";
             size_t prefix_len = strlen(prefix);
@@ -651,7 +660,7 @@ int command_handler(char *cmd, struct sockaddr_in* client_addr, socklen_t client
 
         int ui = user_index_from_src(client_addr);
 
-        // must have an active DSS
+        // user needs to be connected to a dss first
         if (users[ui].active_dss[0] == '\0') {
             strcpy(response, "FAILURE: User has no configured DSS");
             goto send_response;

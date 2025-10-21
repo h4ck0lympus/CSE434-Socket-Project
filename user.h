@@ -39,6 +39,7 @@ typedef struct {
     DiskInfo disks[MAX_DISKS];
 } DSSInfo;
 
+// each thread gets its own copy of this stuff
 typedef struct {
     struct sockaddr_in dest;
     char *request;
@@ -52,7 +53,7 @@ typedef struct {
 
 typedef struct {
     struct sockaddr_in dest;
-    unsigned char *packet;
+    unsigned char *packet;  // thread owns this, frees it when done
     size_t packet_len;
 } BlockSendTask;
 

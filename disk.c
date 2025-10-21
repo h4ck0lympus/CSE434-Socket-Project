@@ -8,6 +8,7 @@ static uint16_t CPORT;
 
 static int MANAGER_SOCK = -1;
 static int COPY_SOCK = -1;
+// this makes shutdown safe between threads
 static volatile sig_atomic_t COPY_THREAD_ACTIVE = 1;
 static pthread_t COPY_THREAD;
 static int COPY_THREAD_STARTED = 0;
@@ -48,6 +49,7 @@ int get_local_ip(char *buffer, size_t buflen) {
 
 static int ensure_directory(const char *path)
 {
+    // try to make dir, dont care if it already exists
     if (mkdir(path, 0775) == -1) {
         if (errno == EEXIST) {
             return 0;
@@ -81,6 +83,7 @@ static int persist_block(const char *dss, const char *file_name, unsigned int st
         return -1;
     }
 
+    // build filename with all the info we need
     char file_path[512];
     snprintf(file_path, sizeof(file_path), "%s/%s/%s/%s_stripe%u_disk%u_%s.bin",
              root, DISK_NAME, dss, file_name, stripe, disk_idx, block_type);
@@ -106,6 +109,7 @@ static int persist_block(const char *dss, const char *file_name, unsigned int st
 static void *copy_listener(void *arg)
 {
     (void)arg;
+    // big buffer for max block size + some extra
     const size_t buf_size = 2048 + 2 * 1024 * 1024;
     unsigned char *buffer = (unsigned char *)malloc(buf_size);
     if (!buffer) {
@@ -129,10 +133,12 @@ static void *copy_listener(void *arg)
             continue;
         }
 
+        // ignore empty packets
         if (recv_len == 0) {
             continue;
         }
 
+        // all commands have header ending with newline
         unsigned char *newline = memchr(buffer, '\n', (size_t)recv_len);
         if (!newline) {
             LOG_INFO("Malformed WRITE command received");
@@ -143,7 +149,7 @@ static void *copy_listener(void *arg)
         size_t payload_len = (size_t)recv_len - header_len - 1;
         buffer[header_len] = '\0';
 
-        // cHeck if this is a WRITE command
+        // check what kind of command this is
         if (strncmp((char *)buffer, "WRITE ", 6) == 0) {
             char dss[NAME_LEN];
             char file_name[NAME_LEN];
@@ -180,15 +186,15 @@ static void *copy_listener(void *arg)
                 continue;
             }
 
-            // construct file path for the requested block
+            // try to find the block - could be data or parity
             char file_path[512];
-            // DATA block
+            // try data first
             snprintf(file_path, sizeof(file_path), "storage/%s/%s/%s_stripe%u_disk%u_DATA.bin",
                      DISK_NAME, dss, file_name, stripe, disk_idx);
             
             FILE *fp = fopen(file_path, "rb");
             if (!fp) {
-                // PARITY block
+                // maybe its parity
                 snprintf(file_path, sizeof(file_path), "storage/%s/%s/%s_stripe%u_disk%u_PARITY.bin",
                          DISK_NAME, dss, file_name, stripe, disk_idx);
                 fp = fopen(file_path, "rb");
@@ -196,7 +202,7 @@ static void *copy_listener(void *arg)
 
             char response_header[256];
             if (fp) {
-                // get file size
+                // figure out how big the block is
                 fseek(fp, 0, SEEK_END);
                 long file_size = ftell(fp);
                 fseek(fp, 0, SEEK_SET);
@@ -241,7 +247,7 @@ static void *copy_listener(void *arg)
             char dss_path[512];
             snprintf(dss_path, sizeof(dss_path), "storage/%s/%s", DISK_NAME, dss_name);
             
-            // Delete the entire DSS directory and its contents
+            // rm -rf everything - this blocks til done
             char rm_cmd[1024];
             snprintf(rm_cmd, sizeof(rm_cmd), "rm -rf \"%s\"", dss_path);
             
@@ -268,7 +274,7 @@ static void *copy_listener(void *arg)
 
             LOG_INFO("Received LIST command for DSS %s", dss_name);
             
-            // scan storage directory for files in this DSS
+            // look through all files we have for this dss
             char dss_path[512];
             snprintf(dss_path, sizeof(dss_path), "storage/%s/%s", DISK_NAME, dss_name);
             
@@ -278,19 +284,18 @@ static void *copy_listener(void *arg)
                 struct dirent *entry;
                 while ((entry = readdir(dir)) != NULL) {
                     if (entry->d_type == DT_REG) { // Regular file
-                        // parse filename to extract file info
-                        // format: filename_stripeX_diskY_TYPE.bin
+                        // pull apart the filename to get info
                         char file_name[NAME_LEN];
                         int stripe_num, disk_num;
                         char block_type[8];
                         
                         if (sscanf(entry->d_name, "%15[^_]_stripe%d_disk%d_%7[^.].bin",
                                    file_name, &stripe_num, &disk_num, block_type) == 4) {
-                            // add to response if not already included
+                            // dont add same file twice
                             char search_pattern[64];
                             snprintf(search_pattern, sizeof(search_pattern), " %s_", file_name);
                             if (!strstr(response, search_pattern)) {
-                                // count stripes for this file
+                                // figure out how many stripes this file has
                                 rewinddir(dir);
                                 int max_stripe = -1;
                                 struct dirent *count_entry;
@@ -430,6 +435,7 @@ int main(int argc, char* argv[])
         LOG_ERROR("bind() with CPORT failed");
     }
 
+    // one thread handles all the file stuff so we dont get races
     if (pthread_create(&COPY_THREAD, NULL, copy_listener, NULL) != 0) {
         LOG_ERROR("Failed to launch copy listener thread");
     } else {

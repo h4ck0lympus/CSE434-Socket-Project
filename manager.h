@@ -14,6 +14,8 @@
 /*
     single threaded manager process to support management 
     of the processes implementing k >= 1 DSS
+    
+    no threads here - too easy to mess up the shared arrays
 */
 
 #define COMMAND_SIZE 1024
@@ -60,6 +62,7 @@ typedef struct {
     int file_count;
 } DSS;
 
+// these track operations in progress so we dont mess things up
 typedef struct {
     char file_name[NAME_LEN];
     int file_size;
