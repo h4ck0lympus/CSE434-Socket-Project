@@ -1,0 +1,48 @@
+make clean && make
+
+Window 1 - manager
+./manager 31500
+
+Window 2 disk D1
+./disk D1 127.0.0.1 31500 32001 32101
+# register-disk D1 127.0.0.1 32001 32101
+
+Window 3
+./disk D2 127.0.0.1 31500 32002 32102
+# register-disk D2 127.0.0.1 32002 32102
+
+Window 4
+./disk D3 127.0.0.1 31500 32003 32103
+# register-disk D3 127.0.0.1 32003 32103
+
+Window 5
+./user user1 127.0.0.1 31500 31501 31551
+# at the prompt:
+register-user
+# then:
+configure-dss DSS1 3 1024
+
+Window 6
+./user user2 127.0.0.1 31500 31502 31552
+# at the prompt:
+register-user
+# then (should FAIL due to no free disks):
+configure-dss DSS2 3 1024
+
+# in user1:
+deregister-user
+# in user2:
+deregister-user
+# (disks will refuse deregister while IN_DSS unless you implement destroy-dss)
+# stop manager with Ctrl-C
+
+
+recovery logic: For each drive in DSS except failed disk D = {0,1,...,n} \ {i}
+For each file f stored on DSS:
+  For each stripe j of file:
+    Read block of stripe j from each disk in D in parallel
+    Compute XOR of n-1 blocks and store as stripe j on drive i for f
+
+First, we need to determine which files exist in this DSS
+We'll query one of the working disks to get the file list
+
